@@ -1,0 +1,459 @@
+import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
+import { getActiveSession, listSessions, addSession, removeSession, setActive } from "./config.js";
+import { buildCodexHeaders } from "./codex.js";
+import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
+
+// --- OAuth helpers ---
+
+const BILLING_BLOCK = {
+  type: "text",
+  text: "x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli; cch=00000;",
+};
+
+function isOAuthToken(token: string): boolean {
+  return token.startsWith("sk-ant-oat01-");
+}
+
+function buildUpstreamHeaders(token: string, incomingHeaders: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "anthropic-version": "2023-06-01",
+  };
+
+  if (isOAuthToken(token)) {
+    headers["authorization"] = `Bearer ${token}`;
+    headers["anthropic-beta"] = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14";
+    headers["anthropic-dangerous-direct-browser-access"] = "true";
+    headers["x-app"] = "cli";
+    headers["user-agent"] = "claude-cli/2.1.87 (external, cli)";
+  } else {
+    headers["x-api-key"] = token;
+  }
+
+  // Forward relevant headers from incoming request
+  const forward = ["anthropic-version", "anthropic-beta", "x-claude-code-session-id", "x-client-request-id"];
+  for (const key of forward) {
+    if (incomingHeaders[key]) headers[key] = incomingHeaders[key];
+  }
+
+  return headers;
+}
+
+function injectBillingHeader(body: any, token: string): any {
+  if (!isOAuthToken(token)) return body;
+
+  const system = body.system;
+  if (system === undefined || system === null) {
+    body.system = [BILLING_BLOCK];
+  } else if (typeof system === "string") {
+    body.system = [BILLING_BLOCK, { type: "text", text: system }];
+  } else if (Array.isArray(system)) {
+    const hasBilling = system.some(
+      (b: any) => typeof b === "object" && b.text?.includes("x-anthropic-billing-header")
+    );
+    if (!hasBilling) body.system = [BILLING_BLOCK, ...system];
+  }
+  return body;
+}
+
+function getUpstreamUrl(baseUrl: string, token: string): string {
+  const url = `${baseUrl}/v1/messages`;
+  return isOAuthToken(token) ? `${url}?beta=true` : url;
+}
+
+// --- Rate limit tracking ---
+const rateLimits: Record<string, Record<string, string>> = {};
+
+function updateRateLimits(sessionName: string, headers: Headers): void {
+  const info: Record<string, string> = {};
+  for (const key of ["x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"]) {
+    const val = headers.get(key);
+    if (val) info[key] = val;
+  }
+  if (Object.keys(info).length > 0) rateLimits[sessionName] = info;
+}
+
+// --- Request body parser ---
+async function readBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString();
+}
+
+// --- Route handlers ---
+
+async function handleProxy(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: any;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "invalid_request", message: "Invalid JSON body." } }));
+    return;
+  }
+
+  const session = getActiveSession();
+  if (!session) {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "no_active_session", message: "No active session. Use 'llm-switcher add' to add one." } }));
+    return;
+  }
+
+  if (session.provider === "openai") {
+    return handleOpenAIProxy(res, body, session);
+  }
+
+  const token = session.token;
+  const baseUrl = session.base_url || "https://api.anthropic.com";
+  const incomingHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (typeof v === "string") incomingHeaders[k] = v;
+  }
+
+  // Apply model override
+  if (session.model_override && !body.model) {
+    body.model = session.model_override;
+  }
+
+  // Inject billing header for OAuth
+  body = injectBillingHeader({ ...body }, token);
+
+  const upstreamUrl = getUpstreamUrl(baseUrl, token);
+  const upstreamHeaders = buildUpstreamHeaders(token, incomingHeaders);
+  const isStream = body.stream === true;
+
+  try {
+    const upstreamRes = await fetch(upstreamUrl, {
+      method: "POST",
+      headers: upstreamHeaders,
+      body: JSON.stringify(body),
+    });
+
+    updateRateLimits(session.name, upstreamRes.headers);
+
+    if (isStream && upstreamRes.body) {
+      // Stream SSE passthrough
+      res.writeHead(upstreamRes.status, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        "connection": "keep-alive",
+      });
+      const reader = upstreamRes.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(decoder.decode(value, { stream: true }));
+      }
+      res.end();
+    } else {
+      // JSON passthrough
+      const responseBody = await upstreamRes.text();
+      res.writeHead(upstreamRes.status, { "content-type": "application/json" });
+      res.end(responseBody);
+    }
+  } catch (err: any) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "upstream_connection_error", message: err.message } }));
+  }
+}
+
+async function handleOpenAIProxy(res: ServerResponse, body: any, session: any): Promise<void> {
+  let translated: { url: string; headers: Record<string, string>; body: string };
+  try {
+    translated = translateRequest(body, session);
+  } catch (err: any) {
+    res.writeHead(422, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "invalid_request", message: err.message } }));
+    return;
+  }
+
+  const isStream = body.stream === true;
+  const requestBody = JSON.parse(translated.body);
+  // Always stream over WebSocket, we'll collect if non-streaming was requested
+  requestBody.stream = true;
+
+  const ws = new WsWebSocket(translated.url, { headers: translated.headers });
+
+  const events: any[] = [];
+  let responseDone = false;
+  const processWsEvent = createWsEventProcessor();
+
+  function endResponse(status: number, body: any): void {
+    if (responseDone) return;
+    responseDone = true;
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  }
+
+  function writeSSE(event: string, data: any): void {
+    if (responseDone) return;
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        "connection": "keep-alive",
+      });
+    }
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  ws.on("open", () => {
+    ws.send(JSON.stringify({ type: "response.create", ...requestBody }));
+  });
+
+  ws.on("message", (data) => {
+    let event: any;
+    try {
+      event = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+
+    if (event.type === "error") {
+      console.error(`[OpenAI] WS error event:`, JSON.stringify(event));
+      endResponse(502, { error: { type: "api_error", message: event.error?.message || "OpenAI error" } });
+      ws.close();
+      return;
+    }
+
+    if (isStream) {
+      processWsEvent(event, writeSSE);
+
+      if (event.type === "response.completed") {
+        processWsEvent({ type: "_finish" }, writeSSE);
+        responseDone = true;
+        res.end();
+        ws.close();
+      }
+    } else {
+      events.push(event);
+
+      if (event.type === "response.completed") {
+        const anthropicRes = translateResponse(event.response);
+        endResponse(200, anthropicRes);
+        ws.close();
+      }
+    }
+  });
+
+  ws.on("error", (err) => {
+    console.error(`[OpenAI] WS connection error:`, err.message);
+    endResponse(502, { error: { type: "upstream_connection_error", message: err.message } });
+  });
+
+  ws.on("close", (code, reason) => {
+    endResponse(502, { error: { type: "upstream_connection_error", message: `WebSocket closed: ${code} ${reason}` } });
+  });
+}
+
+async function handleModels(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const session = getActiveSession();
+  if (!session || session.provider !== "openai") {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "No active OpenAI session" }));
+    return;
+  }
+
+  const baseUrl = session.base_url || "https://api.openai.com";
+  const queryString = req.url?.includes("?") ? req.url.split("?")[1] : "";
+  const url = `${baseUrl}/v1/models${queryString ? "?" + queryString : ""}`;
+
+  // Need account_id from session metadata or codex auth
+  const accountId = session.account_id || "";
+  const headers = buildCodexHeaders(session.token, accountId);
+
+  try {
+    const upstreamRes = await fetch(url, { headers });
+    const body = await upstreamRes.text();
+    res.writeHead(upstreamRes.status, { "content-type": "application/json" });
+    res.end(body);
+  } catch (err: any) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: err.message }));
+  }
+}
+
+async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
+  res.setHeader("content-type", "application/json");
+
+  // GET /admin/sessions
+  if (req.method === "GET" && path === "/admin/sessions") {
+    res.end(JSON.stringify(listSessions()));
+    return;
+  }
+
+  // POST /admin/sessions
+  if (req.method === "POST" && path === "/admin/sessions") {
+    const body = JSON.parse(await readBody(req));
+    if (!body.name || !body.provider || !body.token) {
+      res.writeHead(422);
+      res.end(JSON.stringify({ error: "Fields 'name', 'provider', and 'token' are required." }));
+      return;
+    }
+    addSession(body.name, body.provider, body.token, body.base_url, body.model_override);
+    res.end(JSON.stringify({ status: "ok", message: `Session '${body.name}' added.` }));
+    return;
+  }
+
+  // DELETE /admin/sessions/:name
+  if (req.method === "DELETE" && path.startsWith("/admin/sessions/")) {
+    const name = decodeURIComponent(path.slice("/admin/sessions/".length));
+    removeSession(name);
+    res.end(JSON.stringify({ status: "ok", message: `Session '${name}' removed.` }));
+    return;
+  }
+
+  // POST /admin/switch/:name
+  if (req.method === "POST" && path.startsWith("/admin/switch/")) {
+    const name = decodeURIComponent(path.slice("/admin/switch/".length));
+    try {
+      setActive(name);
+      res.end(JSON.stringify({ status: "ok", message: `Active session set to '${name}'.` }));
+    } catch (err: any) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // GET /admin/status
+  if (req.method === "GET" && path === "/admin/status") {
+    const session = getActiveSession();
+    if (!session) {
+      res.end(JSON.stringify({ active_session: null, rate_limits: {} }));
+      return;
+    }
+    const { token, ...safe } = session;
+    res.end(JSON.stringify({
+      active_session: safe,
+      rate_limits: rateLimits[session.name] || {},
+    }));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: "Not found" }));
+}
+
+// --- Server factory ---
+
+export function createProxyServer() {
+  const server = createServer(async (req, res) => {
+    const url = req.url || "/";
+
+    // Health check (Claude Code sends HEAD / before requests)
+    if ((req.method === "HEAD" || req.method === "GET") && url === "/") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(req.method === "HEAD" ? undefined : JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    // Proxy route for Anthropic (match with or without query params)
+    if (req.method === "POST" && (url === "/v1/messages" || url.startsWith("/v1/messages?"))) {
+      return handleProxy(req, res);
+    }
+
+    // Model discovery for Codex
+    if (req.method === "GET" && url.startsWith("/v1/models")) {
+      return handleModels(req, res);
+    }
+
+    // Admin routes
+    if (url.startsWith("/admin/")) {
+      return handleAdmin(req, res, url);
+    }
+
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  });
+
+  // WebSocket proxy for Codex (/v1/responses)
+  const wss = new WebSocketServer({ server, path: "/responses" });
+
+  wss.on("connection", (clientWs, req) => {
+    const session = getActiveSession();
+    if (!session || session.provider !== "openai") {
+      clientWs.close(4003, "No active OpenAI session");
+      return;
+    }
+
+    const accountId = session.account_id || "";
+
+    // Build upstream headers from session + forward incoming headers
+    const incomingHeaders: Record<string, string> = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (typeof v === "string") incomingHeaders[k.toLowerCase()] = v;
+    }
+
+    const upstreamHeaders = buildCodexHeaders(session.token, accountId, incomingHeaders);
+
+    // Codex OAuth tokens use chatgpt.com backend
+    const upstreamWs = new WsWebSocket("wss://chatgpt.com/backend-api/codex/responses", {
+      headers: upstreamHeaders,
+    });
+
+    let upstreamReady = false;
+    const buffered: (string | Buffer)[] = [];
+
+    upstreamWs.on("open", () => {
+      upstreamReady = true;
+      // Flush buffered messages
+      for (const msg of buffered) {
+        upstreamWs.send(msg);
+      }
+      buffered.length = 0;
+    });
+
+    // Client → Upstream (preserve text/binary frame type)
+    clientWs.on("message", (data, isBinary) => {
+      const msg = isBinary ? data : data.toString();
+      if (upstreamReady) {
+        upstreamWs.send(msg);
+      } else {
+        buffered.push(msg as any);
+      }
+    });
+
+    // Upstream → Client (preserve text/binary frame type)
+    upstreamWs.on("message", (data, isBinary) => {
+      if (clientWs.readyState === clientWs.OPEN) {
+        clientWs.send(isBinary ? data : data.toString());
+      }
+    });
+
+    // Error handling
+    upstreamWs.on("error", (err) => {
+      console.error("Upstream WebSocket error:", err.message);
+      clientWs.close(4502, "Upstream connection error");
+    });
+
+    clientWs.on("error", (err) => {
+      console.error("Client WebSocket error:", err.message);
+      upstreamWs.close();
+    });
+
+    // Close propagation
+    upstreamWs.on("close", (code, reason) => {
+      if (clientWs.readyState === clientWs.OPEN) {
+        clientWs.close(code, reason.toString());
+      }
+    });
+
+    clientWs.on("close", () => {
+      if (upstreamWs.readyState === upstreamWs.OPEN) {
+        upstreamWs.close();
+      }
+    });
+  });
+
+  return server;
+}
+
+export function startServer(port: number = 8411): void {
+  const server = createProxyServer();
+  server.listen(port, "127.0.0.1", () => {
+    console.log(`LLM Switcher proxy running on http://127.0.0.1:${port}`);
+  });
+}
