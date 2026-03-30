@@ -197,6 +197,18 @@ Codex CLI   ──WS /responses──────────► Proxy ──WS�
 
 ---
 
+## Why use this instead of two terminals?
+
+The key advantage is **context continuity** — when you switch models or accounts mid-session, the next model sees your full conversation history, tool results, and file contents. No copy-paste, no re-explaining. This is especially powerful for:
+
+- **Quota failover** — hit the rate limit on one Claude Pro account, switch to another and keep working.
+- **Multiple Claude Pro accounts** — pure passthrough, zero overhead, no downsides.
+- **Cross-model review** — write code with Claude, switch to GPT for a second opinion, all in the same session.
+
+See [docs/comparison.md](docs/comparison.md) for a detailed comparison.
+
+---
+
 ## Known limitations
 
 - **GPT tool compatibility with Claude Code is imperfect.** Claude Code issues tool calls using the Anthropic tool-use format; the proxy translates them to OpenAI `function_call` items. Edge cases around multi-turn tool loops and parallel tool calls may produce unexpected results.

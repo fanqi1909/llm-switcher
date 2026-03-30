@@ -4,3 +4,4 @@ config.json
 .env
 .DS_Store
 test.txt
+python-legacy/
