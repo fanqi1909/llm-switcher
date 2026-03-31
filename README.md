@@ -1,6 +1,6 @@
 # llm-switcher
 
-[![Test](https://github.com/fanqi1909/llm-switcher/actions/workflows/test.yml/badge.svg)](https://github.com/fanqi1909/llm-switcher/actions/workflows/test.yml)
+[![Test](https://github.com/fanqi1909/llm-switcher/actions/workflows/test.yml/badge.svg?branch=main&event=push)](https://github.com/fanqi1909/llm-switcher/actions/workflows/test.yml)
 
 Switch Claude Code and Codex CLI backends locally without losing session context.
 
