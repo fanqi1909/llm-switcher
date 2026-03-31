@@ -1,5 +1,0 @@
-- [Project overview](project-overview.md) — llm-switcher: local proxy translating Anthropic ↔ OpenAI API formats for model/account switching
-- [Codex OAuth endpoint](codex_endpoint.md) — Codex OAuth tokens use chatgpt.com backend, not api.openai.com
-- [User profile](user_profile.md) — Developer building AI tooling, comfortable with TypeScript, uses Claude Code + Codex CLI daily
-- [Translation quirks](translation_quirks.md) — Key gotchas discovered during Anthropic ↔ OpenAI translation implementation
-- [Feedback: concise responses](feedback-concise.md) — User prefers direct, concise communication in Chinese
