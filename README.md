@@ -102,14 +102,6 @@ Import a Codex OAuth session:
 ```bash
 codex
 llm-switcher codex-login
-llm-switcher switch codex
-```
-
-Add sessions manually with API keys:
-
-```bash
-llm-switcher add claude-work --provider anthropic --token sk-ant-...
-llm-switcher add gpt-work --provider openai --token sk-... --model gpt-5.4
 ```
 
 ### 2. Start the proxy
@@ -140,13 +132,22 @@ name = "gpt-5.4"
 base_url = "http://localhost:8411"
 ```
 
-### 4. Switch sessions without restarting the client
+### 4. Switch sessions
 
 ```bash
 llm-switcher list
 llm-switcher switch claude-work
 llm-switcher switch gpt-work
 llm-switcher status
+```
+
+## Manual Session Setup
+
+If you do not want to import OAuth sessions, you can also add sessions manually:
+
+```bash
+llm-switcher add claude-work --provider anthropic --token sk-ant-...
+llm-switcher add gpt-work --provider openai --token sk-... --model gpt-5.4
 ```
 
 ## CLI Commands
