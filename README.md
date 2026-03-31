@@ -1,67 +1,115 @@
 # llm-switcher
 
-A local proxy that lets you use **Claude Code with OpenAI models** and **Codex CLI with Anthropic models** by translating between API formats in real-time. Run it as a sidecar on `localhost:8411`; point Claude Code or Codex CLI at it instead of their respective upstream APIs. The proxy inspects the active session, translates Anthropic Messages API requests into OpenAI Responses API calls (and vice versa), then streams the results back in the format the client expects.
+`llm-switcher` is a local proxy for Claude Code and Codex CLI.
 
----
+It gives you one local endpoint on `localhost:8411` and lets you switch the active backend session without restarting your client. The main use case is keeping one live coding session while rotating between:
 
-## Quick start
+- multiple Claude accounts
+- Claude Code and OpenAI-backed sessions
+- different Codex/OpenAI accounts
 
-### 1. Install
+The point is **context continuity**: when you switch, the next model sees the same conversation, tool results, and file context already held by the client.
+
+## What It Does Today
+
+### Primary use cases
+
+- **Claude Code -> Anthropic**: passthrough, including Claude OAuth sessions
+- **Claude Code -> OpenAI**: Anthropic Messages requests are translated to OpenAI Responses traffic
+- **Multiple Claude accounts**: switch between accounts without opening another terminal
+- **Codex CLI -> OpenAI**: WebSocket bridge through the same local proxy endpoint
+
+### Not supported yet
+
+- **Codex CLI -> Anthropic**
+
+That reverse translation path is not implemented yet. If you point Codex CLI at `llm-switcher`, the active session still needs to be an OpenAI/Codex-compatible one.
+
+## Support Matrix
+
+| Client | Backend | Status | Notes |
+|---|---|---|---|
+| Claude Code | Anthropic | Supported | Native passthrough |
+| Claude Code | OpenAI | Supported | Translated Anthropic -> OpenAI |
+| Codex CLI | OpenAI | Supported | Transparent WebSocket bridge |
+| Codex CLI | Anthropic | Not yet | Reverse translation not implemented |
+
+## Why Use This
+
+- **Keep one session alive across switches** instead of re-explaining context in another terminal
+- **Rotate Claude Pro accounts** when quota is exhausted
+- **Compare models inside one workflow** by switching the backend instead of switching tools
+- **Keep one local endpoint** for scripts, slash commands, and client config
+
+If you just want Claude Code to delegate tasks to Codex, a plugin-style workflow such as [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc) is simpler. `llm-switcher` is for the stronger requirement: transport-level switching while preserving the client session. See [docs/comparison.md](docs/comparison.md).
+
+## Installation
+
+`llm-switcher` is currently distributed as a Node.js CLI, not a standalone binary.
+
+Requirements:
+
+- Node.js 18 or later
+- Claude Code for Claude OAuth import
+- Codex CLI for Codex OAuth import
+
+Install from source:
 
 ```bash
 npm install
 npm run build
-npm link          # makes `llm-switcher` available on PATH
+npm link
 ```
 
-Or run directly with tsx:
+Or run directly in the repo:
 
 ```bash
 npx tsx src/cli.ts <command>
 ```
 
-### 2. Add a session
+## Quick Start
 
-**Anthropic OAuth (Claude Code account):**
+### 1. Add sessions
 
-```bash
-llm-switcher login          # spawns a silent `claude` request to sniff the OAuth token
-```
-
-**Codex CLI OAuth:**
+Import a Claude Code OAuth session:
 
 ```bash
-codex                       # log in once with the Codex CLI to populate ~/.codex/auth.json
-llm-switcher codex-login    # imports the token into llm-switcher
-llm-switcher switch codex   # activate the session
+llm-switcher login
 ```
 
-**Manual API key:**
+Import a Codex OAuth session:
 
 ```bash
-llm-switcher add my-key --provider anthropic --token sk-ant-...
-llm-switcher add gpt-key  --provider openai   --token sk-...   --model gpt-5.4
+codex
+llm-switcher codex-login
+llm-switcher switch codex
 ```
 
-### 3. Start the proxy
+Add sessions manually with API keys:
 
 ```bash
-llm-switcher serve          # listens on 127.0.0.1:8411
-llm-switcher serve -p 9000  # custom port
+llm-switcher add claude-work --provider anthropic --token sk-ant-...
+llm-switcher add gpt-work --provider openai --token sk-... --model gpt-5.4
 ```
 
-### 4. Configure clients
+### 2. Start the proxy
 
-**Claude Code** — redirect all Anthropic API calls through the proxy:
+```bash
+llm-switcher serve
+```
+
+By default it listens on `127.0.0.1:8411`.
+
+### 3. Point your client at the proxy
+
+For Claude Code:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8411
 claude
 ```
 
-Or set it permanently in your shell profile. The proxy forwards requests to the upstream configured in the active session (Anthropic API key, Anthropic OAuth, or translates to OpenAI).
-
-**Codex CLI** — add to `~/.codex/config.toml`:
+For Codex CLI, add this to `~/.codex/config.toml`:
 
 ```toml
 [model]
@@ -72,146 +120,90 @@ name = "gpt-5.4"
 base_url = "http://localhost:8411"
 ```
 
-Codex CLI uses a WebSocket connection; the proxy bridges it to `wss://chatgpt.com/backend-api/codex/responses`.
+### 4. Switch sessions without restarting the client
 
----
+```bash
+llm-switcher list
+llm-switcher switch claude-work
+llm-switcher switch gpt-work
+llm-switcher status
+```
 
-## CLI commands
+## CLI Commands
 
 | Command | Description |
 |---|---|
-| `serve [-p port]` | Start the proxy server (default port 8411) |
-| `login [name]` | Capture a fresh Claude Code OAuth token and register it as a session |
+| `serve [-p port]` | Start the proxy server |
+| `login [name]` | Capture a fresh Claude Code OAuth token and save it as a session |
 | `codex-login [name]` | Import Codex CLI OAuth token from `~/.codex/auth.json` |
-| `add <name> -p <provider> -t <token> [-b url] [-m model]` | Register a session manually |
-| `remove <name>` | Delete a session |
-| `list` | Show all sessions; active session is highlighted |
-| `switch <name>` | Make a session active (hot-swap while proxy is running) |
-| `status` | Show active session and latest rate-limit data |
+| `add <name> -p <provider> -t <token> [-b url] [-m model]` | Add a session manually |
+| `remove <name>` | Remove a session |
+| `list` | List all configured sessions |
+| `switch <name>` | Set the active session |
+| `status` | Show the active session and latest quota info |
 
-CLI commands prefer talking to the running proxy over HTTP (`localhost:8411/admin/*`) and fall back to editing `config.json` directly when the proxy is not running.
+When the proxy is running, management commands go through `http://localhost:8411/admin/*`. If it is not running, the CLI falls back to editing local config directly.
 
----
+## How Sessions Work
 
-## Claude Code integration
-
-### ANTHROPIC_BASE_URL
-
-Set before launching Claude Code:
-
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8411
-```
-
-Claude Code sends a `HEAD /` health-check before every session; the proxy responds with `200 OK`.
-
-### /llm-switch slash command
-
-The file `.claude/commands/llm-switch.md` registers a `/llm-switch` command inside Claude Code:
-
-- `/llm-switch` — lists sessions and asks which to switch to
-- `/llm-switch codex-1` — immediately switches to the named session
-
-The command uses `curl` to call the proxy's admin API, so the proxy must be running.
-
-### Status line
-
-Use `llm-switcher status` from a terminal pane to check which session is active and view remaining quota.
-
----
-
-## Codex CLI integration
-
-The proxy exposes two endpoints that Codex CLI uses:
-
-- `GET /v1/models` — proxied to `https://api.openai.com/v1/models` with Codex OAuth headers
-- `ws://localhost:8411/responses` — WebSocket bridge to `wss://chatgpt.com/backend-api/codex/responses`
-
-Available models confirmed to work with Codex OAuth:
-
-- `gpt-5.4`
-- `gpt-5.4-mini`
-- `gpt-5.3-codex`
-- `gpt-5.2-codex`
-- `gpt-5.2`
-- `gpt-5.1-codex-max`
-- `gpt-5.1-codex-mini`
-
----
-
-## How it works
-
-The proxy sits between the client and the upstream API. On each request it checks the active session's `provider` field:
-
-- **provider = anthropic** — the request is forwarded as-is to the Anthropic Messages API (supports both API keys and OAuth tokens; OAuth requests get the required billing header injected automatically).
-- **provider = openai** — the Anthropic Messages request is translated to an OpenAI Responses API call, sent over WebSocket to `wss://chatgpt.com/backend-api/codex/responses`, and the streaming WebSocket events are translated back to Anthropic SSE events before being written to the client.
-
-Sessions can be switched at any time without restarting the proxy.
-
-### Architecture
-
-```
-Claude Code ──HTTP POST /v1/messages──► Proxy ──WS──► wss://chatgpt.com/backend-api/codex/responses
-                                         │              (OpenAI Responses API, translate request/response)
-                                         │
-Claude Code ──HTTP POST /v1/messages──► Proxy ──HTTPS──► https://api.anthropic.com/v1/messages
-                                         │               (passthrough, OAuth header injection)
-                                         │
-Codex CLI   ──WS /responses──────────► Proxy ──WS──► wss://chatgpt.com/backend-api/codex/responses
-                                                      (transparent frame-level bridge)
-```
-
----
-
-## Session configuration
-
-`config.json` (auto-created, mode 0600):
+`llm-switcher` keeps a local `config.json` in the repo directory:
 
 ```json
 {
-  "active_session": "codex-1",
+  "active_session": "codex",
   "sessions": {
-    "codex-1": {
+    "codex": {
       "provider": "openai",
-      "token": "<Codex OAuth access token>",
+      "token": "<access token>",
       "base_url": "https://api.openai.com",
       "model_override": "gpt-5.4",
-      "account_id": "<chatgpt_account_id from auth.json>"
+      "account_id": "<chatgpt account id>"
     },
-    "claude-pro": {
+    "claude-work": {
       "provider": "anthropic",
-      "token": "sk-ant-oat01-...",
+      "token": "<access token>",
       "base_url": "https://api.anthropic.com"
     }
   }
 }
 ```
 
-| Field | Required | Description |
-|---|---|---|
-| `provider` | yes | `anthropic` or `openai` |
-| `token` | yes | API key or OAuth access token |
-| `base_url` | yes | Upstream API base URL |
-| `model_override` | openai only | Model name sent to OpenAI (required for OpenAI sessions) |
-| `account_id` | openai only | ChatGPT account ID required for Codex OAuth (`chatgpt-account-id` header) |
+| Field | Meaning |
+|---|---|
+| `provider` | `anthropic` or `openai` |
+| `token` | API key or OAuth access token |
+| `base_url` | Upstream base URL |
+| `model_override` | OpenAI model to send upstream |
+| `account_id` | Required for Codex OAuth sessions |
 
----
+The first session you add becomes active by default. You can hot-swap the active session at any time.
 
-## Why use this instead of two terminals?
+## Architecture
 
-The key advantage is **context continuity** — when you switch models or accounts mid-session, the next model sees your full conversation history, tool results, and file contents. No copy-paste, no re-explaining. This is especially powerful for:
+At a high level:
 
-- **Quota failover** — hit the rate limit on one Claude Pro account, switch to another and keep working.
-- **Multiple Claude Pro accounts** — pure passthrough, zero overhead, no downsides.
-- **Cross-model review** — write code with Claude, switch to GPT for a second opinion, all in the same session.
+```text
+Claude Code --HTTP /v1/messages--> llm-switcher --HTTPS--> Anthropic
+Claude Code --HTTP /v1/messages--> llm-switcher --WS-----> chatgpt.com/backend-api/codex/responses
+Codex CLI   --WS /responses-------> llm-switcher --WS-----> chatgpt.com/backend-api/codex/responses
+```
 
-See [docs/comparison.md](docs/comparison.md) for a detailed comparison.
+Two important details:
 
----
+- When the active session is **Anthropic**, Claude Code traffic is passed through with minimal changes.
+- When the active session is **OpenAI**, Claude Code still speaks Anthropic to the proxy, and the proxy translates the request/streaming response to the OpenAI side.
 
-## Known limitations
+For implementation details, protocol mapping, and event flow, see [docs/design.md](docs/design.md).
 
-- **GPT tool compatibility with Claude Code is imperfect.** Claude Code issues tool calls using the Anthropic tool-use format; the proxy translates them to OpenAI `function_call` items. Edge cases around multi-turn tool loops and parallel tool calls may produce unexpected results.
-- **No Codex-to-Anthropic reverse translation yet.** When a Codex CLI session is active, traffic from Codex CLI is bridged directly to OpenAI's backend. Using an Anthropic model as the backend for Codex CLI is not yet implemented.
-- **Unsupported parameters stripped.** `max_output_tokens`, `temperature`, and `top_p` are silently dropped when translating to the `chatgpt.com/backend-api/codex` backend, which does not support them.
-- **OAuth tokens expire.** Re-run `llm-switcher login` or `llm-switcher codex-login` after a token expires.
+## Current Limitations
+
+- **Codex CLI -> Anthropic is not implemented**
+- **Claude Code -> OpenAI is a translation layer**, so some Anthropic-native features do not map perfectly
+- **`max_output_tokens`, `temperature`, and `top_p` are stripped** for the Codex backend because that backend does not support them
+- **OAuth tokens expire**, so `login` / `codex-login` may need to be re-run
+
+## Related Docs
+
+- [docs/design.md](docs/design.md) — technical design and protocol details
+- [docs/comparison.md](docs/comparison.md) — comparison with multiple terminals and `codex-plugin-cc`
+- [docs/oauth-api-discovery.md](docs/oauth-api-discovery.md) — notes on the Codex backend endpoint
