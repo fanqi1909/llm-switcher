@@ -1,7 +1,17 @@
 {
   "name": "llm-switcher",
   "version": "0.2.0",
+  "author": "fanqi1909",
+  "license": "Apache-2.0",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/fanqi1909/llm-switcher.git"
+  },
+  "homepage": "https://github.com/fanqi1909/llm-switcher",
+  "bugs": {
+    "url": "https://github.com/fanqi1909/llm-switcher/issues"
+  },
   "bin": {
     "llm-switcher": "./dist/cli.js"
   },
