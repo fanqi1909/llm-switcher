@@ -24,3 +24,6 @@ jobs:
 
       - name: Run tests
         run: npm run test
+
+      - name: Enforce coverage threshold
+        run: npm run test:coverage

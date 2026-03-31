@@ -2,7 +2,9 @@
 
 [![Test](https://github.com/fanqi1909/llm-switcher/actions/workflows/test.yml/badge.svg)](https://github.com/fanqi1909/llm-switcher/actions/workflows/test.yml)
 
-`llm-switcher` is a local proxy for Claude Code and Codex CLI.
+Switch Claude Code and Codex CLI backends locally without losing session context.
+
+`llm-switcher` is a local proxy that lets one coding session move across Anthropic and OpenAI-backed accounts while keeping the client conversation intact.
 
 It gives you one local endpoint on `localhost:8411` and lets you switch the active backend session without restarting your client. The main use case is keeping one live coding session while rotating between:
 
@@ -196,6 +198,8 @@ When the proxy is running, management commands go through `http://localhost:8411
 
 The first session you add becomes active by default. You can hot-swap the active session at any time.
 
+This is currently a **global active session** model: one local switch affects all clients connected to the proxy. That is fine for a single operator using one main workflow, but if you run multiple local Claude/Codex sessions in parallel and want them pinned to different backends, the current design is too coarse.
+
 ## Architecture
 
 At a high level:
@@ -216,6 +220,7 @@ For implementation details, protocol mapping, and event flow, see [docs/design.m
 ## Current Limitations
 
 - **Codex CLI -> Anthropic is not implemented**
+- **Session selection is global, not per connection.** If you switch the active session in one terminal, other local clients connected to the same proxy will also see that change.
 - **Claude Code -> OpenAI is a translation layer**, so some Anthropic-native features do not map perfectly
 - **`max_output_tokens`, `temperature`, and `top_p` are stripped** for the Codex backend because that backend does not support them
 - **OAuth tokens expire**, so `login` / `codex-login` may need to be re-run
