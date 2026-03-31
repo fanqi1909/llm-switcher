@@ -215,6 +215,28 @@ Rate-limit headers (`x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-r
 
 ---
 
+## Session Selection Model
+
+The proxy now has two session-selection modes:
+
+- **global default session** — used when no scoped override is provided
+- **scoped session override** — used for one request or one WebSocket connection
+
+Scoped selection currently works as follows:
+
+- **HTTP**: `x-llm-switch-session: <name>`
+- **WebSocket**: `/responses?session=<name>`
+
+Semantics:
+
+- HTTP overrides apply only to that request
+- WebSocket overrides apply for the lifetime of that connection
+- if no scoped session is present, the proxy uses the global active session
+
+This preserves backward compatibility while allowing multiple local sessions to be pinned differently.
+
+---
+
 ## OAuth token capture (`login` command)
 
 `sniffOAuthToken()` automates token capture without requiring the user to intercept network traffic:
@@ -231,5 +253,5 @@ Rate-limit headers (`x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-r
 
 - **Reverse translation (OpenAI → Anthropic) for Codex CLI.** When a Codex CLI client connects and the operator wants to use an Anthropic model as the backend, the proxy would need to translate OpenAI Responses API WebSocket frames into Anthropic Messages API calls and stream results back as OpenAI events. This is the inverse of the current Claude Code → OpenAI path and is not yet implemented.
 - **Token refresh.** Both Claude Code OAuth and Codex OAuth tokens have expiry times. Automatic refresh using `refresh_token` from `~/.codex/auth.json` (or the Claude Code keychain) would eliminate the need to re-run `login` commands.
-- **Per-connection session selection.** The current design is local and single-operator oriented, but it still uses one globally active session. This becomes limiting when one person runs multiple local Claude/Codex sessions in parallel and wants each connection pinned to a different backend. Per-connection session selection (e.g. via a request header, path prefix, or connection-bound session assignment) would remove this coupling.
+- **Richer connection-aware session management.** The first scoped-selection layer now exists, but there is still no visibility into pinned connections, no rebinding flow, and no higher-level lane model for sub-agents or parallel task routing.
 - **Tool call result validation.** The proxy does not validate that tool result IDs correspond to previously issued tool calls. Stricter ID tracking would improve error messages for multi-turn tool loops.

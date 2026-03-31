@@ -186,6 +186,16 @@ Why this shape:
 
 This avoids surprising mid-connection backend flips.
 
+## Current Status
+
+The first MVP slice is now implemented:
+
+- global active session remains the default
+- HTTP supports `x-llm-switch-session`
+- WebSocket `/responses` supports `?session=<name>`
+
+This solves the most basic local parallel-session problem without changing the default UX.
+
 ## Admin / UX Implications
 
 The current `switch` command should remain, but its meaning becomes:
@@ -226,17 +236,11 @@ without breaking the current simple usage model.
 
 ## Recommended Next Step
 
-Do not implement immediately.
+Do not jump to a more complex routing system yet.
 
-First:
+Next:
 
-1. validate this design direction against real workflows
-2. decide the exact scoped selection interface
-3. then implement the smallest hybrid version
-
-That smallest version is likely:
-
-- global active session remains
-- HTTP request header override
-- WebSocket query-param override
-- no advanced rebinding yet
+1. validate whether the current scoped override interface is enough for real workflows
+2. decide whether HTTP should also support query-param overrides
+3. decide whether WebSocket rebinding is needed at all
+4. add debugging/visibility for pinned connections if needed

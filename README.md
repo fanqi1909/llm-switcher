@@ -199,7 +199,27 @@ When the proxy is running, management commands go through `http://localhost:8411
 
 The first session you add becomes active by default. You can hot-swap the active session at any time.
 
-This is currently a **global active session** model: one local switch affects all clients connected to the proxy. That is fine for a single operator using one main workflow, but if you run multiple local Claude/Codex sessions in parallel and want them pinned to different backends, the current design is too coarse.
+By default, `llm-switcher` uses a **global active session** model: one local switch affects all clients connected to the proxy.
+
+For more advanced local workflows, you can also override the default session per request or per WebSocket connection.
+
+### Scoped Session Selection
+
+Use a scoped override when you want one local lane pinned differently from the global default.
+
+For HTTP requests:
+
+```http
+x-llm-switch-session: gpt-work
+```
+
+For Codex WebSocket connections:
+
+```text
+/responses?session=gpt-work
+```
+
+If no scoped session is provided, the proxy uses the current global active session.
 
 ## Architecture
 
@@ -221,7 +241,7 @@ For implementation details, protocol mapping, and event flow, see [docs/design.m
 ## Current Limitations
 
 - **Codex CLI -> Anthropic is not implemented**
-- **Session selection is global, not per connection.** If you switch the active session in one terminal, other local clients connected to the same proxy will also see that change.
+- **The default session is still global.** Scoped overrides exist, but the main `switch` command still changes the default backend for all clients that do not explicitly pin a session.
 - **Claude Code -> OpenAI is a translation layer**, so some Anthropic-native features do not map perfectly
 - **`max_output_tokens`, `temperature`, and `top_p` are stripped** for the Codex backend because that backend does not support them
 - **OAuth tokens expire**, so `login` / `codex-login` may need to be re-run

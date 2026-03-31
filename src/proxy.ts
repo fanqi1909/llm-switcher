@@ -82,6 +82,26 @@ function updateRateLimits(sessionName: string, headers: Headers): void {
   if (Object.keys(info).length > 0) rateLimits[sessionName] = info;
 }
 
+function getScopedSession(name: string | null | undefined) {
+  if (!name) return getActiveSession();
+  const { sessions } = listSessions();
+  const session = sessions[name];
+  if (!session) return null;
+  return { name, ...session };
+}
+
+function getRequestedSessionName(req: IncomingMessage): string | null {
+  const header = req.headers["x-llm-switch-session"];
+  if (typeof header === "string" && header.trim()) return header.trim();
+  return null;
+}
+
+function getRequestedWsSessionName(req: IncomingMessage): string | null {
+  const url = req.url || "/responses";
+  const parsed = new URL(url, "http://127.0.0.1");
+  return parsed.searchParams.get("session");
+}
+
 // --- Request body parser ---
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
@@ -105,10 +125,18 @@ async function handleProxy(
     return;
   }
 
-  const session = getActiveSession();
+  const requestedSession = getRequestedSessionName(req);
+  const session = getScopedSession(requestedSession);
   if (!session) {
-    res.writeHead(503, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: { type: "no_active_session", message: "No active session. Use 'llm-switcher add' to add one." } }));
+    res.writeHead(requestedSession ? 404 : 503, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      error: {
+        type: requestedSession ? "session_not_found" : "no_active_session",
+        message: requestedSession
+          ? `Session '${requestedSession}' not found.`
+          : "No active session. Use 'llm-switcher add' to add one.",
+      },
+    }));
     return;
   }
 
@@ -270,8 +298,14 @@ async function handleModels(
   res: ServerResponse,
   deps: Required<ProxyDeps>,
 ): Promise<void> {
-  const session = getActiveSession();
-  if (!session || session.provider !== "openai") {
+  const requestedSession = getRequestedSessionName(req);
+  const session = getScopedSession(requestedSession);
+  if (!session) {
+    res.writeHead(requestedSession ? 404 : 503, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: requestedSession ? `Session '${requestedSession}' not found` : "No active OpenAI session" }));
+    return;
+  }
+  if (session.provider !== "openai") {
     res.writeHead(503, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "No active OpenAI session" }));
     return;
@@ -401,8 +435,16 @@ export function createProxyServer(overrides: ProxyDeps = {}) {
   const wss = new WebSocketServer({ server, path: "/responses" });
 
   wss.on("connection", (clientWs, req) => {
-    const session = getActiveSession();
-    if (!session || session.provider !== "openai") {
+    const requestedSession = getRequestedWsSessionName(req);
+    const session = getScopedSession(requestedSession);
+    if (!session) {
+      clientWs.close(
+        requestedSession ? 4004 : 4003,
+        requestedSession ? `Session '${requestedSession}' not found` : "No active OpenAI session",
+      );
+      return;
+    }
+    if (session.provider !== "openai") {
       clientWs.close(4003, "No active OpenAI session");
       return;
     }
