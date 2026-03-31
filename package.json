@@ -12,14 +12,23 @@
   "bugs": {
     "url": "https://github.com/fanqi1909/llm-switcher/issues"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "llm-switcher": "./dist/cli.js"
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsup src/cli.ts --format esm --dts",
+    "prepack": "npm run build",
     "start": "node dist/cli.js",
     "test": "tsx --test src/translate.test.ts"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "commander": "^13.0.0",

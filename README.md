@@ -10,6 +10,22 @@ It gives you one local endpoint on `localhost:8411` and lets you switch the acti
 
 The point is **context continuity**: when you switch, the next model sees the same conversation, tool results, and file context already held by the client.
 
+## Status
+
+`llm-switcher` is currently an **experimental but working prototype**.
+
+- Core flows are working for Claude Code -> OpenAI, Claude Code -> Anthropic, and Codex CLI -> OpenAI
+- The project is usable for real workflows, but it is **not production-hardened**
+- Protocol compatibility may need maintenance as Claude Code, Codex CLI, and upstream backends evolve
+
+## Tested Setup
+
+The current repo has been tested with:
+
+- Node.js `v25.8.1`
+- Claude Code `2.1.88`
+- Codex CLI `0.117.0`
+
 ## What It Does Today
 
 ### Primary use cases

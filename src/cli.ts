@@ -1,13 +1,21 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { addSession, removeSession, setActive, getActiveSession, listSessions } from "./config.js";
 import { startServer } from "./proxy.js";
 import { sniffOAuthToken } from "./login.js";
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const { version } = JSON.parse(
+  readFileSync(join(__dirname, "..", "package.json"), "utf-8")
+) as { version: string };
+
 const program = new Command()
   .name("llm-switcher")
   .description("LLM proxy switcher - manage multiple LLM accounts")
-  .version("0.1.0");
+  .version(version);
 
 // --- serve ---
 program
