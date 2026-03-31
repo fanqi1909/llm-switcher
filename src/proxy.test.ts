@@ -1,0 +1,605 @@
+import assert from "node:assert/strict";
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { EventEmitter } from "node:events";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { WebSocket, WebSocketServer } from "ws";
+import { createProxyServer } from "./proxy.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CONFIG_PATH = join(__dirname, "..", "config.json");
+
+let originalConfig: string | null = null;
+
+beforeEach(() => {
+  originalConfig = existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf-8") : null;
+  rmSync(CONFIG_PATH, { force: true });
+});
+
+afterEach(() => {
+  if (originalConfig === null) {
+    rmSync(CONFIG_PATH, { force: true });
+    return;
+  }
+  writeFileSync(CONFIG_PATH, originalConfig);
+  chmodSync(CONFIG_PATH, 0o600);
+});
+
+async function withServer(fn: (baseUrl: string) => Promise<void>): Promise<void> {
+  const server = createProxyServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    await fn(baseUrl);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+}
+
+async function request(
+  baseUrl: string,
+  path: string,
+  init?: RequestInit,
+): Promise<{ status: number; headers: Headers; text: string }> {
+  const res = await fetch(`${baseUrl}${path}`, init);
+  return {
+    status: res.status,
+    headers: res.headers,
+    text: await res.text(),
+  };
+}
+
+async function withCustomServer(
+  server: ReturnType<typeof createProxyServer>,
+  fn: (baseUrl: string) => Promise<void>,
+): Promise<void> {
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    await fn(baseUrl);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+}
+
+async function withHttpServer(
+  handler: Parameters<typeof createServer>[0],
+  fn: (baseUrl: string) => Promise<void>,
+): Promise<void> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    await fn(baseUrl);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+}
+
+async function waitForOpen(ws: WebSocket): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    ws.once("open", () => resolve());
+    ws.once("error", reject);
+  });
+}
+
+async function waitForMessage(ws: WebSocket): Promise<{ data: string; isBinary: boolean }> {
+  return new Promise((resolve, reject) => {
+    ws.once("message", (data, isBinary) => resolve({ data: data.toString(), isBinary }));
+    ws.once("error", reject);
+  });
+}
+
+async function waitForClose(ws: WebSocket): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve, reject) => {
+    ws.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+    ws.once("error", reject);
+  });
+}
+
+describe("proxy HTTP routes", () => {
+  it("returns 200 for GET / health check", async () => {
+    await withServer(async (baseUrl) => {
+      const res = await request(baseUrl, "/");
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-type"), "application/json");
+      assert.deepEqual(JSON.parse(res.text), { status: "ok" });
+    });
+  });
+
+  it("returns 200 for HEAD / health check", async () => {
+    await withServer(async (baseUrl) => {
+      const res = await request(baseUrl, "/", { method: "HEAD" });
+      assert.equal(res.status, 200);
+      assert.equal(res.text, "");
+    });
+  });
+
+  it("returns 400 for invalid JSON on /v1/messages", async () => {
+    await withServer(async (baseUrl) => {
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{invalid",
+      });
+
+      assert.equal(res.status, 400);
+      const body = JSON.parse(res.text);
+      assert.equal(body.error.type, "invalid_request");
+    });
+  });
+
+  it("returns 503 when no active session exists", async () => {
+    await withServer(async (baseUrl) => {
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messages: [] }),
+      });
+
+      assert.equal(res.status, 503);
+      const body = JSON.parse(res.text);
+      assert.equal(body.error.type, "no_active_session");
+    });
+  });
+
+  it("returns 503 for /v1/models without an active openai session", async () => {
+    await withServer(async (baseUrl) => {
+      const res = await request(baseUrl, "/v1/models");
+      assert.equal(res.status, 503);
+      assert.deepEqual(JSON.parse(res.text), { error: "No active OpenAI session" });
+    });
+  });
+
+  it("proxies anthropic requests through fetch and applies model override", async () => {
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const proxy = createProxyServer({
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(
+          JSON.stringify({ id: "msg_1", type: "message", role: "assistant", content: [] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-work",
+          provider: "anthropic",
+          token: "sk-ant-test",
+          model_override: "claude-sonnet",
+          base_url: "https://example.anthropic.test",
+        }),
+      });
+
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      assert.equal(res.status, 200);
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, "https://example.anthropic.test/v1/messages");
+      const body = JSON.parse(String(fetchCalls[0].init?.body));
+      assert.equal(body.model, "claude-sonnet");
+      assert.equal(body.messages[0].content, "hi");
+    });
+  });
+
+  it("proxies /v1/models through the active openai session", async () => {
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const proxy = createProxyServer({
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(JSON.stringify({ data: [{ id: "gpt-5.4" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "gpt-work",
+          provider: "openai",
+          token: "sk-openai-test",
+          model_override: "gpt-5.4",
+          base_url: "https://models.example.test",
+        }),
+      });
+
+      const res = await request(baseUrl, "/v1/models?limit=1");
+      assert.equal(res.status, 200);
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, "https://models.example.test/v1/models?limit=1");
+      const body = JSON.parse(res.text);
+      assert.equal(body.data[0].id, "gpt-5.4");
+    });
+  });
+
+  it("translates openai non-streaming responses back to anthropic format", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await new Promise<void>((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+    const upstreamAddress = upstreamServer.address();
+    assert.ok(upstreamAddress && typeof upstreamAddress === "object");
+    const upstreamUrl = `ws://127.0.0.1:${upstreamAddress.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString());
+        assert.equal(msg.type, "response.create");
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_123",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                content: [{ type: "output_text", text: "hello from gpt" }],
+              },
+            ],
+            usage: { input_tokens: 3, output_tokens: 4 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "gpt-work",
+            provider: "openai",
+            token: "sk-openai-test",
+            model_override: "gpt-5.4",
+          }),
+        });
+
+        const res = await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "ignored-by-openai-session",
+            stream: false,
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        });
+
+        assert.equal(res.status, 200);
+        const body = JSON.parse(res.text);
+        assert.equal(body.type, "message");
+        assert.equal(body.role, "assistant");
+        assert.equal(body.content[0].type, "text");
+        assert.equal(body.content[0].text, "hello from gpt");
+        assert.equal(body.usage.input_tokens, 3);
+        assert.equal(body.usage.output_tokens, 4);
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it("streams openai websocket events back as anthropic SSE", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await new Promise<void>((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+    const upstreamAddress = upstreamServer.address();
+    assert.ok(upstreamAddress && typeof upstreamAddress === "object");
+    const upstreamUrl = `ws://127.0.0.1:${upstreamAddress.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.created",
+          response: { id: "resp_stream", model: "gpt-5.4" },
+        }));
+        ws.send(JSON.stringify({
+          type: "response.content_part.added",
+        }));
+        ws.send(JSON.stringify({
+          type: "response.output_text.delta",
+          delta: "Hello",
+        }));
+        ws.send(JSON.stringify({
+          type: "response.output_text.done",
+        }));
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_stream",
+            model: "gpt-5.4",
+            status: "completed",
+            usage: { input_tokens: 2, output_tokens: 3 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "gpt-work",
+            provider: "openai",
+            token: "sk-openai-test",
+            model_override: "gpt-5.4",
+          }),
+        });
+
+        const res = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            stream: true,
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("content-type"), "text/event-stream");
+        const text = await res.text();
+        assert.match(text, /event: message_start/);
+        assert.match(text, /event: content_block_start/);
+        assert.match(text, /event: content_block_delta/);
+        assert.match(text, /"text":"Hello"/);
+        assert.match(text, /event: content_block_stop/);
+        assert.match(text, /event: message_delta/);
+        assert.match(text, /event: message_stop/);
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it("returns 502 when the openai websocket emits an error", async () => {
+    class FakeErrorSocket extends EventEmitter {
+      send(_data: string): void {}
+      close(): void {}
+    }
+
+    const proxy = createProxyServer({
+      openAIWsFactory: () => {
+        const ws = new FakeErrorSocket();
+        queueMicrotask(() => {
+          ws.emit("open");
+          ws.emit("error", new Error("boom"));
+        });
+        return ws as unknown as WebSocket;
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "gpt-work",
+          provider: "openai",
+          token: "sk-openai-test",
+          model_override: "gpt-5.4",
+        }),
+      });
+
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          stream: false,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+
+      assert.equal(res.status, 502);
+      const body = JSON.parse(res.text);
+      assert.equal(body.error.type, "upstream_connection_error");
+      assert.equal(body.error.message, "boom");
+    });
+  });
+});
+
+describe("proxy admin routes", () => {
+  it("adds, lists, switches, reports status, and removes sessions", async () => {
+    await withServer(async (baseUrl) => {
+      const addClaude = await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-work",
+          provider: "anthropic",
+          token: "sk-ant-test",
+        }),
+      });
+      assert.equal(addClaude.status, 200);
+
+      const addGpt = await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "gpt-work",
+          provider: "openai",
+          token: "sk-openai-test",
+          model_override: "gpt-5.4",
+        }),
+      });
+      assert.equal(addGpt.status, 200);
+
+      const listRes = await request(baseUrl, "/admin/sessions");
+      assert.equal(listRes.status, 200);
+      const listed = JSON.parse(listRes.text);
+      assert.equal(listed.active_session, "claude-work");
+      assert.equal(listed.sessions["claude-work"].provider, "anthropic");
+      assert.equal(listed.sessions["gpt-work"].provider, "openai");
+
+      const statusBefore = await request(baseUrl, "/admin/status");
+      assert.equal(statusBefore.status, 200);
+      const beforeBody = JSON.parse(statusBefore.text);
+      assert.equal(beforeBody.active_session.name, "claude-work");
+      assert.equal(beforeBody.active_session.provider, "anthropic");
+      assert.equal(beforeBody.active_session.token, undefined);
+
+      const switchRes = await request(baseUrl, "/admin/switch/gpt-work", {
+        method: "POST",
+      });
+      assert.equal(switchRes.status, 200);
+
+      const statusAfter = await request(baseUrl, "/admin/status");
+      assert.equal(statusAfter.status, 200);
+      const afterBody = JSON.parse(statusAfter.text);
+      assert.equal(afterBody.active_session.name, "gpt-work");
+      assert.equal(afterBody.active_session.provider, "openai");
+      assert.equal(afterBody.active_session.token, undefined);
+
+      const removeRes = await request(baseUrl, "/admin/sessions/gpt-work", {
+        method: "DELETE",
+      });
+      assert.equal(removeRes.status, 200);
+
+      const listAfterRemove = await request(baseUrl, "/admin/sessions");
+      const afterRemoveBody = JSON.parse(listAfterRemove.text);
+      assert.equal(afterRemoveBody.sessions["gpt-work"], undefined);
+      assert.equal(afterRemoveBody.active_session, null);
+    });
+  });
+
+  it("returns 422 when required admin session fields are missing", async () => {
+    await withServer(async (baseUrl) => {
+      const res = await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "broken" }),
+      });
+
+      assert.equal(res.status, 422);
+      assert.match(res.text, /required/);
+    });
+  });
+
+  it("returns 404 when switching to a missing session", async () => {
+    await withServer(async (baseUrl) => {
+      const res = await request(baseUrl, "/admin/switch/missing", {
+        method: "POST",
+      });
+
+      assert.equal(res.status, 404);
+      assert.match(res.text, /not found/);
+    });
+  });
+});
+
+describe("proxy websocket bridge", () => {
+  it("rejects /responses when there is no active openai session", async () => {
+    await withServer(async (baseUrl) => {
+      const ws = new WebSocket(baseUrl.replace("http", "ws") + "/responses");
+      await waitForOpen(ws);
+      const closed = await waitForClose(ws);
+      assert.equal(closed.code, 4003);
+      assert.equal(closed.reason, "No active OpenAI session");
+    });
+  });
+
+  it("buffers client frames until the upstream websocket opens, then forwards both directions", async () => {
+    class FakeUpstreamSocket extends EventEmitter {
+      OPEN = 1;
+      readyState = 0;
+      sent: string[] = [];
+
+      send(data: string | Buffer): void {
+        const text = data.toString();
+        this.sent.push(text);
+        this.emit("message", Buffer.from(`echo:${text}`), false);
+      }
+
+      close(code = 1000, reason = ""): void {
+        this.readyState = 3;
+        this.emit("close", code, Buffer.from(reason));
+      }
+
+      open(): void {
+        this.readyState = this.OPEN;
+        this.emit("open");
+      }
+    }
+
+    let fakeUpstream: FakeUpstreamSocket | null = null;
+
+    const proxy = createProxyServer({
+      codexBridgeUrl: "ws://unused.test",
+      codexBridgeWsFactory: () => {
+        fakeUpstream = new FakeUpstreamSocket();
+        return fakeUpstream as unknown as WebSocket;
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "gpt-work",
+          provider: "openai",
+          token: "sk-openai-test",
+          model_override: "gpt-5.4",
+        }),
+      });
+
+      const clientWs = new WebSocket(baseUrl.replace("http", "ws") + "/responses");
+      await waitForOpen(clientWs);
+
+      clientWs.send("hello-before-upstream-open");
+      assert.ok(fakeUpstream);
+      assert.deepEqual(fakeUpstream.sent, []);
+
+      fakeUpstream.open();
+
+      const reply = await waitForMessage(clientWs);
+      assert.equal(reply.data, "echo:hello-before-upstream-open");
+      assert.deepEqual(fakeUpstream.sent, ["hello-before-upstream-open"]);
+
+      clientWs.close();
+    });
+  });
+});

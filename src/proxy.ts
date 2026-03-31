@@ -4,6 +4,16 @@ import { getActiveSession, listSessions, addSession, removeSession, setActive } 
 import { buildCodexHeaders } from "./codex.js";
 import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
 
+type FetchImpl = typeof fetch;
+type WsFactory = (url: string, options?: { headers?: Record<string, string> }) => WsWebSocket;
+
+interface ProxyDeps {
+  fetchImpl?: FetchImpl;
+  openAIWsFactory?: WsFactory;
+  codexBridgeWsFactory?: WsFactory;
+  codexBridgeUrl?: string;
+}
+
 // --- OAuth helpers ---
 
 const BILLING_BLOCK = {
@@ -83,7 +93,11 @@ async function readBody(req: IncomingMessage): Promise<string> {
 
 // --- Route handlers ---
 
-async function handleProxy(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleProxy(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: Required<ProxyDeps>,
+): Promise<void> {
   let body: any;
   try {
     body = JSON.parse(await readBody(req));
@@ -101,7 +115,7 @@ async function handleProxy(req: IncomingMessage, res: ServerResponse): Promise<v
   }
 
   if (session.provider === "openai") {
-    return handleOpenAIProxy(res, body, session);
+    return handleOpenAIProxy(res, body, session, deps);
   }
 
   const token = session.token;
@@ -124,7 +138,7 @@ async function handleProxy(req: IncomingMessage, res: ServerResponse): Promise<v
   const isStream = body.stream === true;
 
   try {
-    const upstreamRes = await fetch(upstreamUrl, {
+    const upstreamRes = await deps.fetchImpl(upstreamUrl, {
       method: "POST",
       headers: upstreamHeaders,
       body: JSON.stringify(body),
@@ -159,7 +173,12 @@ async function handleProxy(req: IncomingMessage, res: ServerResponse): Promise<v
   }
 }
 
-async function handleOpenAIProxy(res: ServerResponse, body: any, session: any): Promise<void> {
+async function handleOpenAIProxy(
+  res: ServerResponse,
+  body: any,
+  session: any,
+  deps: Required<ProxyDeps>,
+): Promise<void> {
   let translated: { url: string; headers: Record<string, string>; body: string };
   try {
     translated = translateRequest(body, session);
@@ -174,7 +193,7 @@ async function handleOpenAIProxy(res: ServerResponse, body: any, session: any): 
   // Always stream over WebSocket, we'll collect if non-streaming was requested
   requestBody.stream = true;
 
-  const ws = new WsWebSocket(translated.url, { headers: translated.headers });
+  const ws = deps.openAIWsFactory(translated.url, { headers: translated.headers });
 
   const events: any[] = [];
   let responseDone = false;
@@ -248,7 +267,11 @@ async function handleOpenAIProxy(res: ServerResponse, body: any, session: any): 
   });
 }
 
-async function handleModels(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleModels(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: Required<ProxyDeps>,
+): Promise<void> {
   const session = getActiveSession();
   if (!session || session.provider !== "openai") {
     res.writeHead(503, { "content-type": "application/json" });
@@ -265,7 +288,7 @@ async function handleModels(req: IncomingMessage, res: ServerResponse): Promise<
   const headers = buildCodexHeaders(session.token, accountId);
 
   try {
-    const upstreamRes = await fetch(url, { headers });
+    const upstreamRes = await deps.fetchImpl(url, { headers });
     const body = await upstreamRes.text();
     res.writeHead(upstreamRes.status, { "content-type": "application/json" });
     res.end(body);
@@ -339,7 +362,14 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
 
 // --- Server factory ---
 
-export function createProxyServer() {
+export function createProxyServer(overrides: ProxyDeps = {}) {
+  const deps: Required<ProxyDeps> = {
+    fetchImpl: overrides.fetchImpl ?? fetch,
+    openAIWsFactory: overrides.openAIWsFactory ?? ((url, options) => new WsWebSocket(url, options)),
+    codexBridgeWsFactory: overrides.codexBridgeWsFactory ?? ((url, options) => new WsWebSocket(url, options)),
+    codexBridgeUrl: overrides.codexBridgeUrl ?? "wss://chatgpt.com/backend-api/codex/responses",
+  };
+
   const server = createServer(async (req, res) => {
     const url = req.url || "/";
 
@@ -352,12 +382,12 @@ export function createProxyServer() {
 
     // Proxy route for Anthropic (match with or without query params)
     if (req.method === "POST" && (url === "/v1/messages" || url.startsWith("/v1/messages?"))) {
-      return handleProxy(req, res);
+      return handleProxy(req, res, deps);
     }
 
     // Model discovery for Codex
     if (req.method === "GET" && url.startsWith("/v1/models")) {
-      return handleModels(req, res);
+      return handleModels(req, res, deps);
     }
 
     // Admin routes
@@ -390,7 +420,7 @@ export function createProxyServer() {
     const upstreamHeaders = buildCodexHeaders(session.token, accountId, incomingHeaders);
 
     // Codex OAuth tokens use chatgpt.com backend
-    const upstreamWs = new WsWebSocket("wss://chatgpt.com/backend-api/codex/responses", {
+    const upstreamWs = deps.codexBridgeWsFactory(deps.codexBridgeUrl, {
       headers: upstreamHeaders,
     });
 

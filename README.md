@@ -1,5 +1,7 @@
 # llm-switcher
 
+[![Test](https://github.com/fanqi1909/llm-switcher/actions/workflows/test.yml/badge.svg)](https://github.com/fanqi1909/llm-switcher/actions/workflows/test.yml)
+
 `llm-switcher` is a local proxy for Claude Code and Codex CLI.
 
 It gives you one local endpoint on `localhost:8411` and lets you switch the active backend session without restarting your client. The main use case is keeping one live coding session while rotating between:
