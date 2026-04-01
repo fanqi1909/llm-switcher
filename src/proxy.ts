@@ -18,7 +18,7 @@ interface ProxyDeps {
 
 const BILLING_BLOCK = {
   type: "text",
-  text: "x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli; cch=00000;",
+  text: "x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli;",
 };
 
 function isOAuthToken(token: string): boolean {
@@ -33,8 +33,7 @@ function buildUpstreamHeaders(token: string, incomingHeaders: Record<string, str
 
   if (isOAuthToken(token)) {
     headers["authorization"] = `Bearer ${token}`;
-    headers["anthropic-beta"] = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14";
-    headers["anthropic-dangerous-direct-browser-access"] = "true";
+    headers["anthropic-beta"] = "oauth-2025-04-20";
     headers["x-app"] = "cli";
     headers["user-agent"] = "claude-cli/2.1.87 (external, cli)";
   } else {
@@ -67,9 +66,8 @@ function injectBillingHeader(body: any, token: string): any {
   return body;
 }
 
-function getUpstreamUrl(baseUrl: string, token: string): string {
-  const url = `${baseUrl}/v1/messages`;
-  return isOAuthToken(token) ? `${url}?beta=true` : url;
+function getUpstreamUrl(baseUrl: string): string {
+  return `${baseUrl}/v1/messages`;
 }
 
 // --- Rate limit tracking ---
@@ -133,7 +131,7 @@ async function handleProxy(
   // Inject billing header for OAuth
   body = injectBillingHeader({ ...body }, token);
 
-  const upstreamUrl = getUpstreamUrl(baseUrl, token);
+  const upstreamUrl = getUpstreamUrl(baseUrl);
   const upstreamHeaders = buildUpstreamHeaders(token, incomingHeaders);
   const isStream = body.stream === true;
 

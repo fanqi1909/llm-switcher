@@ -39,7 +39,7 @@ OAuth Token (`sk-ant-oat01-*`) 与标准 API Key (`sk-ant-api03-*`) 使用不同
 |------|-------------|-------------|
 | 前缀 | `sk-ant-api03-` | `sk-ant-oat01-` |
 | 认证头 | `x-api-key: <token>` | `Authorization: Bearer <token>` |
-| 端点 | `/v1/messages` | `/v1/messages?beta=true` |
+| 端点 | `/v1/messages` | `/v1/messages` |
 | Beta 标志 | 不需要 | 必须包含 `oauth-2025-04-20` |
 | 计费头 | 不需要 | 必须在 system prompt 中包含 |
 
@@ -73,18 +73,17 @@ Host: localhost:9999
 ### 请求 URL
 
 ```
-POST https://api.anthropic.com/v1/messages?beta=true
+POST https://api.anthropic.com/v1/messages
 ```
 
-注意 `?beta=true` 参数是必须的。
+注意：当前验证结果表明，OAuth 请求不需要 `?beta=true` 参数。
 
 ### 必需请求头
 
 ```http
 Authorization: Bearer <oauth-token>
 anthropic-version: 2023-06-01
-anthropic-beta: claude-code-20250219,oauth-2025-04-20
-anthropic-dangerous-direct-browser-access: true
+anthropic-beta: oauth-2025-04-20
 x-app: cli
 Content-Type: application/json
 ```
@@ -95,8 +94,7 @@ Content-Type: application/json
 |--------|------|
 | `Authorization: Bearer` | OAuth Token 使用 Bearer 认证，而非 `x-api-key` |
 | `anthropic-version` | API 版本，固定值 |
-| `anthropic-beta` | 必须包含 `claude-code-20250219` 和 `oauth-2025-04-20` 两个标志 |
-| `anthropic-dangerous-direct-browser-access` | 允许直接浏览器访问的标志，OAuth 场景必须 |
+| `anthropic-beta` | 必须包含 `oauth-2025-04-20`；Claude Code 发送的额外 beta 标志可原样透传 |
 | `x-app: cli` | 标识调用来源为 CLI 工具 |
 
 ### 必需请求体格式
@@ -111,7 +109,7 @@ Content-Type: application/json
   "system": [
     {
       "type": "text",
-      "text": "x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli; cch=00000;"
+      "text": "x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli;"
     },
     {
       "type": "text",
@@ -174,13 +172,13 @@ Claude Code 会在运行时动态刷新 OAuth Token。存储在 `~/.claude/.env`
 这是服务端的业务校验，不是认证问题。计费头的格式：
 
 ```
-x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli; cch=00000;
+x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli;
 ```
 
 各字段含义：
 - `cc_version`：Claude Code 客户端版本号
 - `cc_entrypoint`：入口点类型（`cli` 表示命令行）
-- `cch`：某种校验哈希（目前发现全零可通过验证）
+- `cch`：Claude Code 在原生链路里可能会动态补充的校验字段，但当前代理路径未发现服务端强制要求
 
 ### 3. Beta 标志说明
 
@@ -188,7 +186,7 @@ x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli; cch=00000;
 
 | 标志 | 用途 | 是否必须 |
 |------|------|----------|
-| `claude-code-20250219` | 启用 Claude Code 专属功能 | 必须 |
+| `claude-code-20250219` | Claude Code 可能发送的额外 beta 标志 | 可透传，但当前代理默认不强制 |
 | `oauth-2025-04-20` | 启用 OAuth Token 认证 | 必须 |
 | `interleaved-thinking-2025-05-14` | 启用交错思考模式 | 可选 |
 | `context-management-2025-06-27` | 启用上下文管理功能 | 可选 |
@@ -217,12 +215,11 @@ x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli; cch=00000;
 ```bash
 TOKEN="sk-ant-oat01-..."
 
-curl -X POST "https://api.anthropic.com/v1/messages?beta=true" \
+curl -X POST "https://api.anthropic.com/v1/messages" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -H "anthropic-version: 2023-06-01" \
-  -H "anthropic-beta: claude-code-20250219,oauth-2025-04-20" \
-  -H "anthropic-dangerous-direct-browser-access: true" \
+  -H "anthropic-beta: oauth-2025-04-20" \
   -H "x-app: cli" \
   -d '{
     "model": "claude-sonnet-4-20250514",
@@ -231,7 +228,7 @@ curl -X POST "https://api.anthropic.com/v1/messages?beta=true" \
     "system": [
       {
         "type": "text",
-        "text": "x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli; cch=00000;"
+        "text": "x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli;"
       },
       {
         "type": "text",
@@ -280,7 +277,7 @@ LLM Switcher Proxy (localhost:8411)
     |-- 在 system 数组中插入计费头（首位）
     |-- 根据路由规则选择目标模型/提供商
     v
-api.anthropic.com/v1/messages?beta=true
+api.anthropic.com/v1/messages
     |
     | 原样透传响应
     v
@@ -292,13 +289,12 @@ Claude Code
 1. **处理 HEAD / 请求**：立即返回 `200 OK`，无需转发
 2. **请求头注入**：
    - 将 `x-api-key` 转换为 `Authorization: Bearer`
-   - 添加 `anthropic-beta: claude-code-20250219,oauth-2025-04-20`
-   - 添加 `anthropic-dangerous-direct-browser-access: true`
+   - 添加 `anthropic-beta: oauth-2025-04-20`
    - 添加 `x-app: cli`
 3. **请求体处理**：
    - 确保 `system` 字段是数组格式
    - 在数组首位插入计费头文本块
-4. **URL 处理**：确保转发到 `?beta=true` 端点
+4. **URL 处理**：直接转发到标准 `/v1/messages` 端点
 5. **响应透传**：直接将 API 响应流式传回 Claude Code
 
 ---
