@@ -200,6 +200,7 @@ describe("proxy HTTP routes", () => {
       });
 
       assert.equal(res.status, 200);
+      assert.equal(res.headers.get("x-llm-session-used"), "claude-work");
       assert.equal(fetchCalls.length, 1);
       assert.equal(fetchCalls[0].url, "https://example.anthropic.test/v1/messages");
       const body = JSON.parse(String(fetchCalls[0].init?.body));
@@ -245,6 +246,7 @@ describe("proxy HTTP routes", () => {
       });
 
       assert.equal(res.status, 200);
+      assert.equal(res.headers.get("x-llm-session-used"), "claude-oauth");
       assert.equal(fetchCalls.length, 1);
       assert.equal(fetchCalls[0].url, "https://oauth.example.test/v1/messages");
 
@@ -329,6 +331,7 @@ describe("proxy HTTP routes", () => {
         });
 
         assert.equal(res.status, 200);
+        assert.equal(res.headers.get("x-llm-session-used"), "gpt-work");
         const body = JSON.parse(res.text);
         assert.equal(body.content[0].text, "from override session");
       });
@@ -407,6 +410,7 @@ describe("proxy HTTP routes", () => {
         });
 
         assert.equal(res.status, 200);
+        assert.equal(res.headers.get("x-llm-session-used"), "gpt-work");
         const body = JSON.parse(res.text);
         assert.equal(body.content[0].text, "from alias header");
       });
@@ -460,6 +464,7 @@ describe("proxy HTTP routes", () => {
 
       const res = await request(baseUrl, "/v1/models?limit=1");
       assert.equal(res.status, 200);
+      assert.equal(res.headers.get("x-llm-session-used"), "gpt-work");
       assert.equal(fetchCalls.length, 1);
       assert.equal(fetchCalls[0].url, "https://models.example.test/v1/models?limit=1");
       const body = JSON.parse(res.text);
@@ -507,6 +512,7 @@ describe("proxy HTTP routes", () => {
       });
 
       assert.equal(res.status, 200);
+      assert.equal(res.headers.get("x-llm-session-used"), "gpt-work");
       assert.equal(fetchCalls.length, 1);
       assert.equal(fetchCalls[0].url, "https://models.example.test/v1/models");
     });
@@ -650,6 +656,7 @@ describe("proxy HTTP routes", () => {
 
         assert.equal(res.status, 200);
         assert.equal(res.headers.get("content-type"), "text/event-stream");
+        assert.equal(res.headers.get("x-llm-session-used"), "gpt-work");
         const text = await res.text();
         assert.match(text, /event: message_start/);
         assert.match(text, /event: content_block_start/);
@@ -750,6 +757,9 @@ describe("proxy admin routes", () => {
       assert.equal(beforeBody.active_session.name, "claude-work");
       assert.equal(beforeBody.active_session.provider, "anthropic");
       assert.equal(beforeBody.active_session.token, undefined);
+      assert.deepEqual(beforeBody.available_sessions, ["claude-work", "gpt-work"]);
+      assert.equal(beforeBody.override_header, "x-llm-session");
+      assert.equal(beforeBody.override_ws_param, "?session=<name>");
 
       const switchRes = await request(baseUrl, "/admin/switch/gpt-work", {
         method: "POST",
@@ -762,6 +772,9 @@ describe("proxy admin routes", () => {
       assert.equal(afterBody.active_session.name, "gpt-work");
       assert.equal(afterBody.active_session.provider, "openai");
       assert.equal(afterBody.active_session.token, undefined);
+      assert.deepEqual(afterBody.available_sessions, ["claude-work", "gpt-work"]);
+      assert.equal(afterBody.override_header, "x-llm-session");
+      assert.equal(afterBody.override_ws_param, "?session=<name>");
 
       const removeRes = await request(baseUrl, "/admin/sessions/gpt-work", {
         method: "DELETE",
@@ -785,6 +798,19 @@ describe("proxy admin routes", () => {
 
       assert.equal(res.status, 422);
       assert.match(res.text, /required/);
+    });
+  });
+
+  it("reports observability hints even when no active session exists", async () => {
+    await withServer(async (baseUrl) => {
+      const res = await request(baseUrl, "/admin/status");
+      assert.equal(res.status, 200);
+      const body = JSON.parse(res.text);
+      assert.equal(body.active_session, null);
+      assert.deepEqual(body.available_sessions, []);
+      assert.equal(body.override_header, "x-llm-session");
+      assert.equal(body.override_ws_param, "?session=<name>");
+      assert.deepEqual(body.rate_limits, {});
     });
   });
 
