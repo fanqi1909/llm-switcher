@@ -467,7 +467,7 @@ describe("proxy HTTP routes", () => {
     });
   });
 
-  it("uses x-llm-switch-session to override the global session for /v1/models", async () => {
+  it("uses x-llm-session to override the global session for /v1/models", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     const proxy = createProxyServer({
       fetchImpl: async (url, init) => {
@@ -503,7 +503,7 @@ describe("proxy HTTP routes", () => {
       });
 
       const res = await request(baseUrl, "/v1/models", {
-        headers: { "x-llm-switch-session": "gpt-work" },
+        headers: { "x-llm-session": "gpt-work" },
       });
 
       assert.equal(res.status, 200);

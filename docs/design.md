@@ -224,7 +224,7 @@ The proxy now has two session-selection modes:
 
 Scoped selection currently works as follows:
 
-- **HTTP**: `x-llm-switch-session: <name>`
+- **HTTP**: `x-llm-session: <name>` (preferred; `x-llm-switch-session` remains a compatibility alias)
 - **WebSocket**: `/responses?session=<name>`
 
 Semantics:

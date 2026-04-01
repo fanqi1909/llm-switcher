@@ -162,7 +162,7 @@ Use the **hybrid model**.
 
 For the first iteration:
 
-- **HTTP**: allow a request header such as `x-llm-switch-session: <name>`
+- **HTTP**: allow a request header such as `x-llm-session: <name>` (with `x-llm-switch-session` kept as a compatibility alias)
 - **WebSocket**: allow a query parameter such as `/responses?session=<name>`
 
 Why this shape:
@@ -191,7 +191,8 @@ This avoids surprising mid-connection backend flips.
 The first MVP slice is now implemented:
 
 - global active session remains the default
-- HTTP supports `x-llm-switch-session`
+- HTTP supports `x-llm-session`
+- `x-llm-switch-session` remains accepted as a compatibility alias
 - WebSocket `/responses` supports `?session=<name>`
 
 This solves the most basic local parallel-session problem without changing the default UX.

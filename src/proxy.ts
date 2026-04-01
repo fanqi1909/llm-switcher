@@ -91,7 +91,7 @@ function getScopedSession(name: string | null | undefined) {
 }
 
 function getRequestedSessionName(req: IncomingMessage): string | null {
-  const header = req.headers["x-llm-switch-session"];
+  const header = req.headers["x-llm-session"] ?? req.headers["x-llm-switch-session"];
   if (typeof header === "string" && header.trim()) return header.trim();
   return null;
 }

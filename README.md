@@ -210,7 +210,7 @@ Use a scoped override when you want one local lane pinned differently from the g
 For HTTP requests:
 
 ```http
-x-llm-switch-session: gpt-work
+x-llm-session: gpt-work
 ```
 
 For Codex WebSocket connections:
@@ -220,6 +220,8 @@ For Codex WebSocket connections:
 ```
 
 If no scoped session is provided, the proxy uses the current global active session.
+
+`x-llm-switch-session` is still accepted as a compatibility alias, but `x-llm-session` is the preferred header going forward.
 
 ## Architecture
 
