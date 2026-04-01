@@ -208,6 +208,58 @@ describe("proxy HTTP routes", () => {
     });
   });
 
+  it("uses the lean OAuth header set and billing block for anthropic OAuth sessions", async () => {
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const proxy = createProxyServer({
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(
+          JSON.stringify({ id: "msg_1", type: "message", role: "assistant", content: [] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-oauth",
+          provider: "anthropic",
+          token: "sk-ant-oat01-test-token",
+          base_url: "https://oauth.example.test",
+        }),
+      });
+
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+        },
+        body: JSON.stringify({
+          messages: [{ role: "user", content: "hi" }],
+          system: "Be concise.",
+        }),
+      });
+
+      assert.equal(res.status, 200);
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, "https://oauth.example.test/v1/messages");
+
+      const headers = fetchCalls[0].init?.headers as Record<string, string>;
+      assert.equal(headers.authorization, "Bearer sk-ant-oat01-test-token");
+      assert.equal(headers["anthropic-beta"], "claude-code-20250219,oauth-2025-04-20");
+      assert.equal(headers["anthropic-dangerous-direct-browser-access"], undefined);
+      assert.equal(headers["x-app"], "cli");
+
+      const body = JSON.parse(String(fetchCalls[0].init?.body));
+      assert.equal(body.system[0].text, "x-anthropic-billing-header: cc_version=2.1.87.d34; cc_entrypoint=cli;");
+      assert.equal(body.system[1].text, "Be concise.");
+    });
+  });
+
   it("proxies /v1/models through the active openai session", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     const proxy = createProxyServer({
