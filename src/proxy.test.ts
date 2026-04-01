@@ -260,6 +260,179 @@ describe("proxy HTTP routes", () => {
     });
   });
 
+  it("uses x-llm-session to override the global session for HTTP requests", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await new Promise<void>((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+    const upstreamAddress = upstreamServer.address();
+    assert.ok(upstreamAddress && typeof upstreamAddress === "object");
+    const upstreamUrl = `ws://127.0.0.1:${upstreamAddress.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_override",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                content: [{ type: "output_text", text: "from override session" }],
+              },
+            ],
+            usage: { input_tokens: 1, output_tokens: 2 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "claude-work",
+            provider: "anthropic",
+            token: "sk-ant-test",
+          }),
+        });
+
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "gpt-work",
+            provider: "openai",
+            token: "sk-openai-test",
+            model_override: "gpt-5.4",
+          }),
+        });
+
+        const res = await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-llm-session": "gpt-work",
+          },
+          body: JSON.stringify({
+            stream: false,
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        });
+
+        assert.equal(res.status, 200);
+        const body = JSON.parse(res.text);
+        assert.equal(body.content[0].text, "from override session");
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it("still accepts x-llm-switch-session as a compatibility alias", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await new Promise<void>((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+    const upstreamAddress = upstreamServer.address();
+    assert.ok(upstreamAddress && typeof upstreamAddress === "object");
+    const upstreamUrl = `ws://127.0.0.1:${upstreamAddress.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_alias",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                content: [{ type: "output_text", text: "from alias header" }],
+              },
+            ],
+            usage: { input_tokens: 1, output_tokens: 2 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "claude-work",
+            provider: "anthropic",
+            token: "sk-ant-test",
+          }),
+        });
+
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "gpt-work",
+            provider: "openai",
+            token: "sk-openai-test",
+            model_override: "gpt-5.4",
+          }),
+        });
+
+        const res = await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-llm-switch-session": "gpt-work",
+          },
+          body: JSON.stringify({
+            stream: false,
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        });
+
+        assert.equal(res.status, 200);
+        const body = JSON.parse(res.text);
+        assert.equal(body.content[0].text, "from alias header");
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it("returns 404 when x-llm-session points to a missing session", async () => {
+    await withServer(async (baseUrl) => {
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-llm-session": "missing",
+        },
+        body: JSON.stringify({ messages: [] }),
+      });
+
+      assert.equal(res.status, 404);
+      const body = JSON.parse(res.text);
+      assert.equal(body.error.type, "session_not_found");
+    });
+  });
+
   it("proxies /v1/models through the active openai session", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     const proxy = createProxyServer({
@@ -291,6 +464,51 @@ describe("proxy HTTP routes", () => {
       assert.equal(fetchCalls[0].url, "https://models.example.test/v1/models?limit=1");
       const body = JSON.parse(res.text);
       assert.equal(body.data[0].id, "gpt-5.4");
+    });
+  });
+
+  it("uses x-llm-session to override the global session for /v1/models", async () => {
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const proxy = createProxyServer({
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(JSON.stringify({ data: [{ id: "gpt-5.4" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-work",
+          provider: "anthropic",
+          token: "sk-ant-test",
+        }),
+      });
+
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "gpt-work",
+          provider: "openai",
+          token: "sk-openai-test",
+          model_override: "gpt-5.4",
+          base_url: "https://models.example.test",
+        }),
+      });
+
+      const res = await request(baseUrl, "/v1/models", {
+        headers: { "x-llm-session": "gpt-work" },
+      });
+
+      assert.equal(res.status, 200);
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, "https://models.example.test/v1/models");
     });
   });
 
@@ -590,6 +808,88 @@ describe("proxy websocket bridge", () => {
       const closed = await waitForClose(ws);
       assert.equal(closed.code, 4003);
       assert.equal(closed.reason, "No active OpenAI session");
+    });
+  });
+
+  it("uses the session query parameter to override the global session for websocket connections", async () => {
+    class FakeUpstreamSocket extends EventEmitter {
+      OPEN = 1;
+      readyState = 0;
+      sent: string[] = [];
+
+      send(data: string | Buffer): void {
+        const text = data.toString();
+        this.sent.push(text);
+        this.emit("message", Buffer.from(`echo:${text}`), false);
+      }
+
+      close(code = 1000, reason = ""): void {
+        this.readyState = 3;
+        this.emit("close", code, Buffer.from(reason));
+      }
+
+      open(): void {
+        this.readyState = this.OPEN;
+        this.emit("open");
+      }
+    }
+
+    let fakeUpstream: FakeUpstreamSocket | null = null;
+
+    const proxy = createProxyServer({
+      codexBridgeUrl: "ws://unused.test",
+      codexBridgeWsFactory: () => {
+        fakeUpstream = new FakeUpstreamSocket();
+        return fakeUpstream as unknown as WebSocket;
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-work",
+          provider: "anthropic",
+          token: "sk-ant-test",
+        }),
+      });
+
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "gpt-work",
+          provider: "openai",
+          token: "sk-openai-test",
+          model_override: "gpt-5.4",
+        }),
+      });
+
+      const clientWs = new WebSocket(baseUrl.replace("http", "ws") + "/responses?session=gpt-work");
+      await waitForOpen(clientWs);
+
+      clientWs.send("hello-scoped");
+      assert.ok(fakeUpstream);
+      assert.deepEqual(fakeUpstream.sent, []);
+
+      fakeUpstream.open();
+
+      const reply = await waitForMessage(clientWs);
+      assert.equal(reply.data, "echo:hello-scoped");
+      assert.deepEqual(fakeUpstream.sent, ["hello-scoped"]);
+
+      clientWs.close();
+    });
+  });
+
+  it("rejects /responses when the session query parameter points to a missing session", async () => {
+    await withServer(async (baseUrl) => {
+      const ws = new WebSocket(baseUrl.replace("http", "ws") + "/responses?session=missing");
+      await waitForOpen(ws);
+      const closed = await waitForClose(ws);
+      assert.equal(closed.code, 4004);
+      assert.equal(closed.reason, "Session 'missing' not found");
     });
   });
 
