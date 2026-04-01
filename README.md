@@ -223,6 +223,14 @@ If no scoped session is provided, the proxy uses the current global active sessi
 
 `x-llm-switch-session` is still accepted as a compatibility alias, but `x-llm-session` is the preferred header going forward.
 
+For proxied HTTP requests, the response includes:
+
+```http
+x-llm-session-used: <session-name>
+```
+
+This makes it easy to verify which session actually handled a request when you are using scoped overrides.
+
 ## Architecture
 
 At a high level:

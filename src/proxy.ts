@@ -14,6 +14,10 @@ interface ProxyDeps {
   codexBridgeUrl?: string;
 }
 
+function sessionUsedHeader(sessionName: string): Record<string, string> {
+  return { "x-llm-session-used": sessionName };
+}
+
 // --- OAuth helpers ---
 
 const BILLING_BLOCK = {
@@ -178,6 +182,7 @@ async function handleProxy(
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         "connection": "keep-alive",
+        ...sessionUsedHeader(session.name),
       });
       const reader = upstreamRes.body.getReader();
       const decoder = new TextDecoder();
@@ -190,11 +195,17 @@ async function handleProxy(
     } else {
       // JSON passthrough
       const responseBody = await upstreamRes.text();
-      res.writeHead(upstreamRes.status, { "content-type": "application/json" });
+      res.writeHead(upstreamRes.status, {
+        "content-type": "application/json",
+        ...sessionUsedHeader(session.name),
+      });
       res.end(responseBody);
     }
   } catch (err: any) {
-    res.writeHead(502, { "content-type": "application/json" });
+    res.writeHead(502, {
+      "content-type": "application/json",
+      ...sessionUsedHeader(session.name),
+    });
     res.end(JSON.stringify({ error: { type: "upstream_connection_error", message: err.message } }));
   }
 }
@@ -228,7 +239,10 @@ async function handleOpenAIProxy(
   function endResponse(status: number, body: any): void {
     if (responseDone) return;
     responseDone = true;
-    res.writeHead(status, { "content-type": "application/json" });
+    res.writeHead(status, {
+      "content-type": "application/json",
+      ...sessionUsedHeader(session.name),
+    });
     res.end(JSON.stringify(body));
   }
 
@@ -239,6 +253,7 @@ async function handleOpenAIProxy(
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         "connection": "keep-alive",
+        ...sessionUsedHeader(session.name),
       });
     }
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -322,10 +337,16 @@ async function handleModels(
   try {
     const upstreamRes = await deps.fetchImpl(url, { headers });
     const body = await upstreamRes.text();
-    res.writeHead(upstreamRes.status, { "content-type": "application/json" });
+    res.writeHead(upstreamRes.status, {
+      "content-type": "application/json",
+      ...sessionUsedHeader(session.name),
+    });
     res.end(body);
   } catch (err: any) {
-    res.writeHead(502, { "content-type": "application/json" });
+    res.writeHead(502, {
+      "content-type": "application/json",
+      ...sessionUsedHeader(session.name),
+    });
     res.end(JSON.stringify({ error: err.message }));
   }
 }
@@ -376,13 +397,24 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
   // GET /admin/status
   if (req.method === "GET" && path === "/admin/status") {
     const session = getActiveSession();
+    const { sessions } = listSessions();
+    const availableSessions = Object.keys(sessions);
     if (!session) {
-      res.end(JSON.stringify({ active_session: null, rate_limits: {} }));
+      res.end(JSON.stringify({
+        active_session: null,
+        available_sessions: availableSessions,
+        override_header: "x-llm-session",
+        override_ws_param: "?session=<name>",
+        rate_limits: {},
+      }));
       return;
     }
     const { token, ...safe } = session;
     res.end(JSON.stringify({
       active_session: safe,
+      available_sessions: availableSessions,
+      override_header: "x-llm-session",
+      override_ws_param: "?session=<name>",
       rate_limits: rateLimits[session.name] || {},
     }));
     return;
