@@ -6,6 +6,7 @@ import { Command } from "commander";
 import { addSession, removeSession, setActive, getActiveSession, listSessions } from "./config.js";
 import { startServer } from "./proxy.js";
 import { sniffOAuthToken } from "./login.js";
+import { renderClaudeStatusline } from "./statusline.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const { version } = JSON.parse(
@@ -175,6 +176,25 @@ program
     } else {
       console.log("Quota: (no data yet)");
     }
+  });
+
+// --- statusline ---
+program
+  .command("statusline")
+  .description("Render statusline text for Claude-style stdin payloads")
+  .option("--json", "Output normalized routing context as JSON")
+  .action(async (opts) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+    const rawInput = Buffer.concat(chunks).toString("utf-8");
+    const result = await renderClaudeStatusline(rawInput);
+
+    if (opts.json) {
+      console.log(JSON.stringify(result.context, null, 2));
+      return;
+    }
+
+    console.log(result.text);
   });
 
 // --- HTTP helper ---

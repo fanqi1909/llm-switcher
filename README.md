@@ -162,6 +162,7 @@ llm-switcher add gpt-work --provider openai --token sk-... --model gpt-5.4
 | `list` | List all configured sessions |
 | `switch <name>` | Set the active session |
 | `status` | Show the active session and latest quota info |
+| `statusline [--json]` | Render provider-aware statusline text from Claude-style stdin JSON |
 
 When the proxy is running, management commands go through `http://localhost:8411/admin/*`. If it is not running, the CLI falls back to editing local config directly.
 
@@ -231,6 +232,8 @@ x-llm-session-used: <session-name>
 
 This makes it easy to verify which session actually handled a request when you are using scoped overrides.
 
+For Claude Code custom statusline integration, `llm-switcher statusline` reads the statusline JSON payload on stdin and resolves proxy state from the current process env before falling back to proxy-global defaults.
+
 ## Architecture
 
 At a high level:
@@ -246,7 +249,7 @@ Two important details:
 - When the active session is **Anthropic**, Claude Code traffic is passed through with minimal changes.
 - When the active session is **OpenAI**, Claude Code still speaks Anthropic to the proxy, and the proxy translates the request/streaming response to the OpenAI side.
 
-For implementation details, protocol mapping, and event flow, see [docs/design.md](docs/design.md).
+For implementation details, protocol mapping, and event flow, see [docs/design.md](docs/design.md). For statusline-specific design notes, see [docs/statusline-design.md](docs/statusline-design.md).
 
 ## Current Limitations
 
@@ -259,5 +262,6 @@ For implementation details, protocol mapping, and event flow, see [docs/design.m
 ## Related Docs
 
 - [docs/design.md](docs/design.md) — technical design and protocol details
+- [docs/statusline-design.md](docs/statusline-design.md) — provider-agnostic statusline design for Claude/Codex
 - [docs/comparison.md](docs/comparison.md) — comparison with multiple terminals and `codex-plugin-cc`
 - [docs/oauth-api-discovery.md](docs/oauth-api-discovery.md) — notes on the Codex backend endpoint
