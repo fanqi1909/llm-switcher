@@ -58,6 +58,17 @@ That reverse translation path is not implemented yet. If you point Codex CLI at 
 | Codex CLI | OpenAI | Supported | Transparent WebSocket bridge |
 | Codex CLI | Anthropic | Not yet | Reverse translation not implemented |
 
+### Why not point Claude directly at GLM/Z.AI?
+
+GLM and Z.AI both expose Claude-compatible endpoints, but their direct Claude setup typically maps Claude-facing model slots such as Opus, Sonnet, and Haiku onto provider-defined backend models.
+
+`llm-switcher` intentionally keeps that control in the local session layer instead:
+
+- provider choice stays explicit
+- `model_override` stays explicit
+- GLM remains one backend among many
+- switching between GLM, GPT, and real Claude sessions still happens locally through the same workflow
+
 ## Why Use This
 
 - **Keep one session alive across switches** instead of re-explaining context in another terminal

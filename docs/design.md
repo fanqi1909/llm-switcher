@@ -68,6 +68,12 @@ The proxy now has two distinct expansion patterns:
 
 This distinction is important for future roadmap decisions: not every provider addition should be treated like a new protocol integration.
 
+There is also an important control-plane distinction for GLM-style providers:
+
+- A provider may expose a direct Claude-compatible setup that maps Claude-facing model slots such as Opus, Sonnet, and Haiku onto provider-defined backend models.
+- `llm-switcher` should not rely on that mapping as the primary user model.
+- Instead, provider selection and model selection should remain explicit in the local session layer so users can still switch cleanly between GLM, GPT, and real Claude sessions.
+
 ### Request mapping: Anthropic Messages → OpenAI Responses API
 
 `translateRequest()` in `translate.ts` maps an Anthropic `POST /v1/messages` body to an OpenAI Responses API payload.
