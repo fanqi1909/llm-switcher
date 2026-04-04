@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { addSession, removeSession, setActive, getActiveSession, listSessions } from "./config.js";
+import { addSession, removeSession, setActive, getActiveSession, getSession, listSessions, setSessionModel } from "./config.js";
 import { startServer } from "./proxy.js";
 import { sniffOAuthToken } from "./login.js";
 import { renderClaudeStatusline } from "./statusline.js";
@@ -158,6 +158,48 @@ program
     for (const model of result.data) {
       if (model?.id) console.log(model.id);
     }
+  });
+
+// --- model ---
+program
+  .command("model [name]")
+  .description("Show the configured model for the active or named session")
+  .action((name) => {
+    const session = name ? getSession(name) : getActiveSession();
+
+    if (!session) {
+      console.error(
+        name
+          ? `Error: Session '${name}' not found.`
+          : "Error: No active session. Use 'llm-switcher switch <name>' first.",
+      );
+      process.exit(1);
+    }
+
+    if (!session.model_override) {
+      console.log(
+        name
+          ? `Session '${session.name}' has no model configured.`
+          : `Active session '${session.name}' has no model configured.`,
+      );
+      return;
+    }
+
+    console.log(session.model_override);
+  });
+
+// --- set-model ---
+program
+  .command("set-model <name> <model>")
+  .description("Set the configured model for a session")
+  .action((name, model) => {
+    try {
+      setSessionModel(name, model);
+    } catch (e: any) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    console.log(`\u2713 Set model for '${name}' to '${model}'`);
   });
 
 // --- switch ---
