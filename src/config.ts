@@ -5,8 +5,10 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "..", "config.json");
 
+export type Provider = "anthropic" | "openai" | "glm";
+
 export interface Session {
-  provider: "anthropic" | "openai";
+  provider: Provider;
   token: string;
   base_url: string;
   model_override?: string;
@@ -32,9 +34,21 @@ export function saveConfig(config: Config): void {
   chmodSync(CONFIG_PATH, 0o600);
 }
 
+export function getDefaultBaseUrl(provider: Provider): string {
+  switch (provider) {
+    case "anthropic":
+      return "https://api.anthropic.com";
+    case "glm":
+      return "https://open.bigmodel.cn/api/anthropic";
+    case "openai":
+    default:
+      return "https://api.openai.com";
+  }
+}
+
 export function addSession(
   name: string,
-  provider: "anthropic" | "openai",
+  provider: Provider,
   token: string,
   baseUrl?: string,
   modelOverride?: string,
@@ -44,7 +58,7 @@ export function addSession(
   config.sessions[name] = {
     provider,
     token,
-    base_url: baseUrl ?? (provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com"),
+    base_url: baseUrl ?? getDefaultBaseUrl(provider),
     ...(modelOverride ? { model_override: modelOverride } : {}),
     ...(accountId ? { account_id: accountId } : {}),
   };

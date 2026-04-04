@@ -508,6 +508,41 @@ describe("proxy HTTP routes", () => {
     });
   });
 
+  it("proxies /v1/models through the active glm session using the coding-plan endpoint", async () => {
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const proxy = createProxyServer({
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(JSON.stringify({ data: [{ id: "glm-4.7" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "glm-work",
+          provider: "glm",
+          token: "glm-key-test",
+        }),
+      });
+
+      const res = await request(baseUrl, "/v1/models");
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("x-llm-session-used"), "glm-work");
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, "https://open.bigmodel.cn/api/anthropic/v1/models");
+      const headers = fetchCalls[0].init?.headers as Record<string, string>;
+      assert.equal(headers["x-api-key"], "glm-key-test");
+      const body = JSON.parse(res.text);
+      assert.equal(body.data[0].id, "glm-4.7");
+    });
+  });
+
   it("uses x-llm-session to override the global session for /v1/models", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     const proxy = createProxyServer({

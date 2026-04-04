@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   addSession,
+  getDefaultBaseUrl,
   getActiveSession,
   getSession,
   listSessions,
@@ -48,6 +49,12 @@ describe("config persistence", () => {
     assert.equal(mode, 0o600);
   });
 
+  it("returns provider default base URLs including GLM", () => {
+    assert.equal(getDefaultBaseUrl("anthropic"), "https://api.anthropic.com");
+    assert.equal(getDefaultBaseUrl("openai"), "https://api.openai.com");
+    assert.equal(getDefaultBaseUrl("glm"), "https://open.bigmodel.cn/api/anthropic");
+  });
+
   it("adds the first session as active and persists defaults", () => {
     addSession("claude-work", "anthropic", "sk-ant-test");
 
@@ -70,6 +77,15 @@ describe("config persistence", () => {
     assert.equal(listed.sessions["gpt-work"].model_override, "gpt-5.4");
     assert.equal(listed.sessions["gpt-work"].account_id, "acct_123");
     assert.equal(listed.sessions["gpt-work"].base_url, "https://api.openai.com");
+  });
+
+  it("uses the GLM coding-plan anthropic endpoint as the default base URL", () => {
+    addSession("glm-work", "glm", "glm-key-test");
+
+    const session = getSession("glm-work");
+    assert.ok(session);
+    assert.equal(session.provider, "glm");
+    assert.equal(session.base_url, "https://open.bigmodel.cn/api/anthropic");
   });
 
   it("switches the active session", () => {

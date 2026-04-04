@@ -25,6 +25,15 @@ describe("model fallback helpers", () => {
     ]);
   });
 
+  it("returns GLM fallback models", () => {
+    assert.deepEqual(getFallbackModels("glm"), [
+      "glm-4.7",
+      "glm-4.5-air",
+      "glm-4.5-x",
+      "glm-z1-air",
+    ]);
+  });
+
   it("uses fallback for auth and permission failures", () => {
     assert.equal(shouldUseFallbackModels(401), true);
     assert.equal(shouldUseFallbackModels(403), true);
