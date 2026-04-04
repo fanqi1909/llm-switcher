@@ -35,6 +35,9 @@ Current major gap:
 - If a change is design-heavy, capture the design in `docs/` before or alongside implementation.
 - Keep PRs narrow and tied to one issue or one decision when possible.
 - Do not create commits unless explicitly asked by the user/operator.
+- Keep the primary repo directory on `main` for local service runs and manual testing.
+- For feature work, prefer `git worktree` instead of switching branches in the primary repo directory.
+- Remove feature worktrees after merge when they are no longer needed.
 
 ## Testing Expectations
 
