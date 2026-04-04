@@ -7,6 +7,7 @@ import { addSession, removeSession, setActive, getActiveSession, listSessions } 
 import { startServer } from "./proxy.js";
 import { sniffOAuthToken } from "./login.js";
 import { renderClaudeStatusline } from "./statusline.js";
+import { getDefaultClaudeCommandsDir, installClaudeCommand } from "./claude-command.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const { version } = JSON.parse(
@@ -195,6 +196,17 @@ program
     }
 
     console.log(result.text);
+  });
+
+// --- install-claude-command ---
+program
+  .command("install-claude-command")
+  .description("Install /llm-switch as a global Claude command")
+  .option("--dir <dir>", "Target Claude commands directory")
+  .action((opts) => {
+    const targetDir = opts.dir || getDefaultClaudeCommandsDir();
+    const targetPath = installClaudeCommand(targetDir);
+    console.log(`✓ Installed Claude command at ${targetPath}`);
   });
 
 // --- HTTP helper ---

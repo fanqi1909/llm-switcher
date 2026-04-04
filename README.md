@@ -132,6 +132,12 @@ name = "gpt-5.4"
 base_url = "http://localhost:8411"
 ```
 
+Optional: install `/llm-switch` as a global Claude command so it is available outside this repo:
+
+```bash
+llm-switcher install-claude-command
+```
+
 ### 4. Switch sessions
 
 ```bash
@@ -163,6 +169,7 @@ llm-switcher add gpt-work --provider openai --token sk-... --model gpt-5.4
 | `switch <name>` | Set the active session |
 | `status` | Show the active session and latest quota info |
 | `statusline [--json]` | Render provider-aware statusline text from Claude-style stdin JSON |
+| `install-claude-command [--dir path]` | Install `/llm-switch` into Claude's commands directory |
 
 When the proxy is running, management commands go through `http://localhost:8411/admin/*`. If it is not running, the CLI falls back to editing local config directly.
 
