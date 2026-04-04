@@ -4,17 +4,15 @@
 
 Switch Claude Code and Codex CLI backends locally without losing session context.
 
-`llm-switcher` is a local proxy that lets one coding session move across Anthropic and OpenAI-backed accounts while keeping the client conversation intact.
+`llm-switcher` is a local proxy for Claude Code and Codex CLI that switches between Anthropic and OpenAI-backed sessions without forcing you to restart the client or split work across multiple terminals.
 
-It is designed for local Claude Code and Codex CLI workflows that need backend switching across Anthropic and OpenAI without opening a second terminal or losing context.
-
-It gives you one local endpoint on `localhost:8411` and lets you switch the active backend session without restarting your client. The main use case is keeping one live coding session while rotating between:
+It gives you one local endpoint on `localhost:8411` and preserves **context continuity** while you rotate between:
 
 - multiple Claude accounts
 - Claude Code and OpenAI-backed sessions
 - different Codex/OpenAI accounts
 
-The point is **context continuity**: when you switch, the next model sees the same conversation, tool results, and file context already held by the client.
+When you switch, the next backend still sees the same conversation, tool results, and file context already held by the client.
 
 ## Status
 
