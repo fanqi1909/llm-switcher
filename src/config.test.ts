@@ -6,11 +6,13 @@ import { fileURLToPath } from "node:url";
 import {
   addSession,
   getActiveSession,
+  getSession,
   listSessions,
   loadConfig,
   removeSession,
   saveConfig,
   setActive,
+  setSessionModel,
 } from "./config.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -79,6 +81,38 @@ describe("config persistence", () => {
     const active = getActiveSession();
     assert.ok(active);
     assert.equal(active.name, "gpt-work");
+  });
+
+  it("returns a named session without changing the active session", () => {
+    addSession("claude-work", "anthropic", "sk-ant-test");
+    addSession("gpt-work", "openai", "sk-openai-test", undefined, "gpt-5.4");
+
+    const session = getSession("gpt-work");
+    assert.ok(session);
+    assert.equal(session.name, "gpt-work");
+    assert.equal(session.model_override, "gpt-5.4");
+    assert.equal(getActiveSession()?.name, "claude-work");
+  });
+
+  it("returns null for a missing named session", () => {
+    addSession("claude-work", "anthropic", "sk-ant-test");
+    assert.equal(getSession("missing"), null);
+  });
+
+  it("updates the configured model for a named session", () => {
+    addSession("claude-work", "anthropic", "sk-ant-test");
+    addSession("gpt-work", "openai", "sk-openai-test");
+
+    setSessionModel("claude-work", "claude-sonnet-4-5");
+    setSessionModel("gpt-work", "gpt-5.4");
+
+    assert.equal(getSession("claude-work")?.model_override, "claude-sonnet-4-5");
+    assert.equal(getSession("gpt-work")?.model_override, "gpt-5.4");
+  });
+
+  it("throws when setting a model for a missing session", () => {
+    addSession("claude-work", "anthropic", "sk-ant-test");
+    assert.throws(() => setSessionModel("missing", "gpt-5.4"), /not found/);
   });
 
   it("throws when switching to a missing session", () => {

@@ -74,6 +74,21 @@ export function getActiveSession(): (Session & { name: string }) | null {
   return { name: config.active_session, ...session };
 }
 
+export function getSession(name: string): (Session & { name: string }) | null {
+  const config = loadConfig();
+  const session = config.sessions[name];
+  if (!session) return null;
+  return { name, ...session };
+}
+
+export function setSessionModel(name: string, model: string): void {
+  const config = loadConfig();
+  const session = config.sessions[name];
+  if (!session) throw new Error(`Session '${name}' not found`);
+  session.model_override = model;
+  saveConfig(config);
+}
+
 export function listSessions(): { sessions: Record<string, Session>; active_session: string | null } {
   const config = loadConfig();
   return { sessions: config.sessions, active_session: config.active_session };

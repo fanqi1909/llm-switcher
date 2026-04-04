@@ -142,7 +142,12 @@ llm-switcher install-claude-command
 
 ```bash
 llm-switcher list
+llm-switcher models claude-work
 llm-switcher models gpt-work
+llm-switcher set-model claude-work claude-sonnet-4-5
+llm-switcher set-model gpt-work gpt-5.4
+llm-switcher model claude-work
+llm-switcher model gpt-work
 llm-switcher switch claude-work
 llm-switcher switch gpt-work
 llm-switcher status
@@ -154,7 +159,8 @@ If you do not want to import OAuth sessions, you can also add sessions manually:
 
 ```bash
 llm-switcher add claude-work --provider anthropic --token sk-ant-...
-llm-switcher add gpt-work --provider openai --token sk-... --model gpt-5.4
+llm-switcher add gpt-work --provider openai --token sk-...
+llm-switcher set-model gpt-work gpt-5.4
 ```
 
 ## CLI Commands
@@ -168,6 +174,8 @@ llm-switcher add gpt-work --provider openai --token sk-... --model gpt-5.4
 | `remove <name>` | Remove a session |
 | `list` | List all configured sessions |
 | `models [name]` | List available models for the active or named session |
+| `model [name]` | Show the configured model for the active or named session |
+| `set-model <name> <model>` | Set the configured model for a session |
 | `switch <name>` | Set the active session |
 | `status` | Show the active session and latest quota info |
 | `statusline [--json]` | Render provider-aware statusline text from Claude-style stdin JSON |
@@ -204,10 +212,17 @@ When the proxy is running, management commands go through `http://localhost:8411
 | `provider` | `anthropic` or `openai` |
 | `token` | API key or OAuth access token |
 | `base_url` | Upstream base URL |
-| `model_override` | OpenAI model to send upstream |
+| `model_override` | Model currently pinned for that session |
 | `account_id` | Required for Codex OAuth sessions |
 
 The first session you add becomes active by default. You can hot-swap the active session at any time.
+
+Session identity and model selection are intentionally separate:
+
+- use `login`, `codex-login`, or `add` to create the session
+- use `models [name]` to inspect the provider's available models
+- use `set-model <name> <model>` to pin one model for that session
+- use `model [name]` to check the current pinned model
 
 By default, `llm-switcher` uses a **global active session** model: one local switch affects all clients connected to the proxy.
 
