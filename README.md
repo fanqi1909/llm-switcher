@@ -224,6 +224,8 @@ Session identity and model selection are intentionally separate:
 - use `set-model <name> <model>` to pin one model for that session
 - use `model [name]` to check the current pinned model
 
+If a provider blocks model listing for your current token, `models [name]` falls back to a built-in provider-specific suggestion list instead of failing silently.
+
 By default, `llm-switcher` uses a **global active session** model: one local switch affects all clients connected to the proxy.
 
 For more advanced local workflows, you can also override the default session per request or per WebSocket connection.
