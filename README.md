@@ -142,6 +142,7 @@ llm-switcher install-claude-command
 
 ```bash
 llm-switcher list
+llm-switcher models gpt-work
 llm-switcher switch claude-work
 llm-switcher switch gpt-work
 llm-switcher status
@@ -166,6 +167,7 @@ llm-switcher add gpt-work --provider openai --token sk-... --model gpt-5.4
 | `add <name> -p <provider> -t <token> [-b url] [-m model]` | Add a session manually |
 | `remove <name>` | Remove a session |
 | `list` | List all configured sessions |
+| `models [name]` | List available models for the active or named OpenAI session |
 | `switch <name>` | Set the active session |
 | `status` | Show the active session and latest quota info |
 | `statusline [--json]` | Render provider-aware statusline text from Claude-style stdin JSON |
