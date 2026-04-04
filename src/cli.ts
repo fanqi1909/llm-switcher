@@ -8,6 +8,7 @@ import { startServer } from "./proxy.js";
 import { sniffOAuthToken } from "./login.js";
 import { renderClaudeStatusline } from "./statusline.js";
 import { getDefaultClaudeCommandsDir, installClaudeCommand } from "./claude-command.js";
+import { getFallbackModels, shouldUseFallbackModels } from "./models.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const { version } = JSON.parse(
@@ -138,6 +139,16 @@ program
   .command("models [name]")
   .description("List available models for the active or named session")
   .action(async (name) => {
+    const session = name ? getSession(name) : getActiveSession();
+    if (!session) {
+      console.error(
+        name
+          ? `Error: Session '${name}' not found.`
+          : "Error: No active session. Use 'llm-switcher switch <name>' first.",
+      );
+      process.exit(1);
+    }
+
     const headers = name ? { "x-llm-session": name } : undefined;
     const result = await tryHttpDetailed("GET", "/v1/models", undefined, headers);
 
@@ -151,6 +162,19 @@ program
         typeof result.body?.error === "string"
           ? result.body.error
           : result.body?.error?.message || result.body?.message;
+
+      if (shouldUseFallbackModels(result.status)) {
+        const target = name ? `session '${session.name}'` : `active session '${session.name}'`;
+        const fallbackModels = getFallbackModels(session.provider);
+        console.warn(
+          `Warning: Unable to fetch provider models for ${target} (HTTP ${result.status}). ` +
+          `Showing built-in ${session.provider} model suggestions instead.` +
+          (upstreamMessage ? ` ${upstreamMessage}` : ""),
+        );
+        for (const model of fallbackModels) console.log(model);
+        return;
+      }
+
       const scopeHint = upstreamMessage ? ` ${upstreamMessage}` : "";
       console.error(
         name
