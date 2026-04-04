@@ -262,6 +262,7 @@ For implementation details, protocol mapping, and event flow, see [docs/design.m
 ## Related Docs
 
 - [docs/design.md](docs/design.md) — technical design and protocol details
+- [docs/agent-guidelines.md](docs/agent-guidelines.md) — repo-wide guidance for coding agents
 - [docs/statusline-design.md](docs/statusline-design.md) — provider-agnostic statusline design for Claude/Codex
 - [docs/comparison.md](docs/comparison.md) — comparison with multiple terminals and `codex-plugin-cc`
 - [docs/oauth-api-discovery.md](docs/oauth-api-discovery.md) — notes on the Codex backend endpoint
