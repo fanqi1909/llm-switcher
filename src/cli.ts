@@ -139,23 +139,42 @@ program
   .description("List available models for the active or named session")
   .action(async (name) => {
     const headers = name ? { "x-llm-session": name } : undefined;
-    const result = await tryHttp("GET", "/v1/models", undefined, headers);
+    const result = await tryHttpDetailed("GET", "/v1/models", undefined, headers);
 
-    if (!result?.data || !Array.isArray(result.data)) {
+    if (!result.ok) {
+      if (result.error === "unreachable") {
+        console.error("Error: Unable to reach llm-switcher at http://localhost:8411. Make sure 'llm-switcher serve' is running.");
+        process.exit(1);
+      }
+
+      const upstreamMessage =
+        typeof result.body?.error === "string"
+          ? result.body.error
+          : result.body?.error?.message || result.body?.message;
+      const scopeHint = upstreamMessage ? ` ${upstreamMessage}` : "";
       console.error(
         name
-          ? `Error: Unable to fetch models for session '${name}'. Make sure it exists and is supported.`
-          : "Error: Unable to fetch models. Make sure there is an active session.",
+          ? `Error: Unable to fetch models for session '${name}' (HTTP ${result.status}).${scopeHint}`
+          : `Error: Unable to fetch models (HTTP ${result.status}).${scopeHint}`,
       );
       process.exit(1);
     }
 
-    if (result.data.length === 0) {
+    if (!result.body?.data || !Array.isArray(result.body.data)) {
+      console.error(
+        name
+          ? `Error: Session '${name}' returned an unexpected models payload.`
+          : "Error: The active session returned an unexpected models payload.",
+      );
+      process.exit(1);
+    }
+
+    if (result.body.data.length === 0) {
       console.log("No models returned.");
       return;
     }
 
-    for (const model of result.data) {
+    for (const model of result.body.data) {
       if (model?.id) console.log(model.id);
     }
   });
@@ -299,6 +318,37 @@ async function tryHttp(
     return res.json();
   } catch {
     return null;
+  }
+}
+
+async function tryHttpDetailed(
+  method: string,
+  path: string,
+  body?: any,
+  extraHeaders?: Record<string, string>,
+): Promise<{ ok: true; status: number; body: any } | { ok: false; status: number | null; body: any; error?: "unreachable" }> {
+  try {
+    const res = await fetch(`http://localhost:8411${path}`, {
+      method,
+      headers: {
+        ...(body ? { "content-type": "application/json" } : {}),
+        ...(extraHeaders || {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(3000),
+    });
+
+    let parsed: any = null;
+    try {
+      parsed = await res.json();
+    } catch {
+      parsed = null;
+    }
+
+    if (!res.ok) return { ok: false, status: res.status, body: parsed };
+    return { ok: true, status: res.status, body: parsed };
+  } catch {
+    return { ok: false, status: null, body: null, error: "unreachable" };
   }
 }
 
