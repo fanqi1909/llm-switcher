@@ -317,22 +317,21 @@ async function handleModels(
   const session = getScopedSession(requestedSession);
   if (!session) {
     res.writeHead(requestedSession ? 404 : 503, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: requestedSession ? `Session '${requestedSession}' not found` : "No active OpenAI session" }));
-    return;
-  }
-  if (session.provider !== "openai") {
-    res.writeHead(503, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "No active OpenAI session" }));
+    res.end(JSON.stringify({ error: requestedSession ? `Session '${requestedSession}' not found` : "No active session" }));
     return;
   }
 
-  const baseUrl = session.base_url || "https://api.openai.com";
+  const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
   const queryString = req.url?.includes("?") ? req.url.split("?")[1] : "";
   const url = `${baseUrl}/v1/models${queryString ? "?" + queryString : ""}`;
 
-  // Need account_id from session metadata or codex auth
-  const accountId = session.account_id || "";
-  const headers = buildCodexHeaders(session.token, accountId);
+  let headers: Record<string, string>;
+  if (session.provider === "openai") {
+    const accountId = session.account_id || "";
+    headers = buildCodexHeaders(session.token, accountId);
+  } else {
+    headers = buildUpstreamHeaders(session.token, {});
+  }
 
   try {
     const upstreamRes = await deps.fetchImpl(url, { headers });

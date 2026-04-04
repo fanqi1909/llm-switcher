@@ -136,7 +136,7 @@ program
 // --- models ---
 program
   .command("models [name]")
-  .description("List available models for the active or named OpenAI session")
+  .description("List available models for the active or named session")
   .action(async (name) => {
     const headers = name ? { "x-llm-session": name } : undefined;
     const result = await tryHttp("GET", "/v1/models", undefined, headers);
@@ -144,8 +144,8 @@ program
     if (!result?.data || !Array.isArray(result.data)) {
       console.error(
         name
-          ? `Error: Unable to fetch models for session '${name}'. Make sure it exists and is an OpenAI session.`
-          : "Error: Unable to fetch models. Make sure the active session is an OpenAI session.",
+          ? `Error: Unable to fetch models for session '${name}'. Make sure it exists and is supported.`
+          : "Error: Unable to fetch models. Make sure there is an active session.",
       );
       process.exit(1);
     }
