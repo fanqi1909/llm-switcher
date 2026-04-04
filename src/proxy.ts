@@ -1,6 +1,6 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
-import { getActiveSession, listSessions, addSession, removeSession, setActive } from "./config.js";
+import { getActiveSession, listSessions, addSession, removeSession, setActive, getDefaultBaseUrl } from "./config.js";
 import { buildCodexHeaders } from "./codex.js";
 import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
 
@@ -149,7 +149,7 @@ async function handleProxy(
   }
 
   const token = session.token;
-  const baseUrl = session.base_url || "https://api.anthropic.com";
+  const baseUrl = session.base_url || getDefaultBaseUrl(session.provider);
   const incomingHeaders: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (typeof v === "string") incomingHeaders[k] = v;
@@ -321,7 +321,7 @@ async function handleModels(
     return;
   }
 
-  const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
+  const baseUrl = session.base_url || getDefaultBaseUrl(session.provider);
   const queryString = req.url?.includes("?") ? req.url.split("?")[1] : "";
   const url = `${baseUrl}/v1/models${queryString ? "?" + queryString : ""}`;
 

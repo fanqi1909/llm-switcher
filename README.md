@@ -36,6 +36,7 @@ The current repo has been tested with:
 
 - **Claude Code -> Anthropic**: passthrough, including Claude OAuth sessions
 - **Claude Code -> OpenAI**: Anthropic Messages requests are translated to OpenAI Responses traffic
+- **Claude Code -> GLM Coding Plan**: Anthropic-compatible passthrough via the GLM Claude endpoint
 - **Multiple Claude accounts**: switch between accounts without opening another terminal
 - **Codex CLI -> OpenAI**: WebSocket bridge through the same local proxy endpoint
 
@@ -51,8 +52,20 @@ That reverse translation path is not implemented yet. If you point Codex CLI at 
 |---|---|---|---|
 | Claude Code | Anthropic | Supported | Native passthrough |
 | Claude Code | OpenAI | Supported | Translated Anthropic -> OpenAI |
+| Claude Code | GLM Coding Plan | Experimental | Anthropic-compatible endpoint |
 | Codex CLI | OpenAI | Supported | Transparent WebSocket bridge |
 | Codex CLI | Anthropic | Not yet | Reverse translation not implemented |
+
+### Why not point Claude directly at GLM/Z.AI?
+
+GLM and Z.AI both expose Claude-compatible endpoints, but their direct Claude setup typically maps Claude-facing model slots such as Opus, Sonnet, and Haiku onto provider-defined backend models.
+
+`llm-switcher` intentionally keeps that control in the local session layer instead:
+
+- provider choice stays explicit
+- `model_override` stays explicit
+- GLM remains one backend among many
+- switching between GLM, GPT, and real Claude sessions still happens locally through the same workflow
 
 ## Why Use This
 
@@ -104,8 +117,10 @@ Then do the minimal first-run flow:
 ```bash
 llm-switcher login claude
 llm-switcher codex-login gpt-work
+llm-switcher add glm-work --provider glm --token <GLM_API_KEY>
 llm-switcher set-model claude claude-sonnet-4-5
 llm-switcher set-model gpt-work gpt-5.4
+llm-switcher set-model glm-work glm-4.7
 llm-switcher serve
 ```
 
@@ -188,7 +203,9 @@ If you do not want to import OAuth sessions, you can also add sessions manually:
 ```bash
 llm-switcher add claude-work --provider anthropic --token sk-ant-...
 llm-switcher add gpt-work --provider openai --token sk-...
+llm-switcher add glm-work --provider glm --token <GLM_API_KEY>
 llm-switcher set-model gpt-work gpt-5.4
+llm-switcher set-model glm-work glm-4.7
 ```
 
 ## CLI Commands
@@ -198,7 +215,7 @@ llm-switcher set-model gpt-work gpt-5.4
 | `serve [-p port]` | Start the proxy server |
 | `login [name]` | Capture a fresh Claude Code OAuth token and save it as a session |
 | `codex-login [name]` | Import Codex CLI OAuth token from `~/.codex/auth.json` |
-| `add <name> -p <provider> -t <token> [-b url] [-m model]` | Add a session manually |
+| `add <name> -p <provider> -t <token> [-b url] [-m model]` | Add a session manually (`provider`: `anthropic`, `openai`, or `glm`) |
 | `remove <name>` | Remove a session |
 | `list` | List all configured sessions |
 | `models [name]` | List available models for the active or named session |
@@ -230,6 +247,12 @@ When the proxy is running, management commands go through `http://localhost:8411
       "provider": "anthropic",
       "token": "<access token>",
       "base_url": "https://api.anthropic.com"
+    },
+    "glm-work": {
+      "provider": "glm",
+      "token": "<glm api key>",
+      "base_url": "https://open.bigmodel.cn/api/anthropic",
+      "model_override": "glm-4.7"
     }
   }
 }
@@ -237,7 +260,7 @@ When the proxy is running, management commands go through `http://localhost:8411
 
 | Field | Meaning |
 |---|---|
-| `provider` | `anthropic` or `openai` |
+| `provider` | `anthropic`, `openai`, or `glm` |
 | `token` | API key or OAuth access token |
 | `base_url` | Upstream base URL |
 | `model_override` | Model currently pinned for that session |
@@ -253,6 +276,12 @@ Session identity and model selection are intentionally separate:
 - use `model [name]` to check the current pinned model
 
 If a provider blocks model listing for your current token, `models [name]` falls back to a built-in provider-specific suggestion list instead of failing silently.
+
+For GLM Coding Plan, `glm` sessions use the Anthropic-compatible Claude endpoint by default:
+
+```text
+https://open.bigmodel.cn/api/anthropic
+```
 
 By default, `llm-switcher` uses a **global active session** model: one local switch affects all clients connected to the proxy.
 

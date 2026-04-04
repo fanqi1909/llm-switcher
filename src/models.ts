@@ -18,8 +18,23 @@ const ANTHROPIC_FALLBACK_MODELS = [
   "claude-3-5-haiku",
 ];
 
+const GLM_FALLBACK_MODELS = [
+  "glm-4.7",
+  "glm-4.5-air",
+  "glm-4.5-x",
+  "glm-z1-air",
+];
+
 export function getFallbackModels(provider: Session["provider"]): string[] {
-  return provider === "anthropic" ? ANTHROPIC_FALLBACK_MODELS : OPENAI_FALLBACK_MODELS;
+  switch (provider) {
+    case "anthropic":
+      return ANTHROPIC_FALLBACK_MODELS;
+    case "glm":
+      return GLM_FALLBACK_MODELS;
+    case "openai":
+    default:
+      return OPENAI_FALLBACK_MODELS;
+  }
 }
 
 export function shouldUseFallbackModels(status: number | null): boolean {

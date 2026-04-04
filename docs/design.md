@@ -7,6 +7,7 @@ Claude Code speaks the Anthropic Messages API exclusively. Codex CLI speaks the 
 1. Lets Claude Code drive OpenAI GPT models by translating Anthropic → OpenAI in real-time.
 2. Lets Codex CLI talk to its OpenAI backend through a single local endpoint that can be switched without restarting the client.
 3. Preserves streaming behavior end-to-end so both clients see native SSE or WebSocket events.
+4. Supports provider growth either through new transport families or through provider presets on top of an existing transport family.
 
 ---
 
@@ -24,6 +25,9 @@ Claude Code speaks the Anthropic Messages API exclusively. Codex CLI speaks the 
                           active session = anthropic                │
                           ──────────────────────────────────────────► HTTPS api.anthropic.com
                                                                     │   (passthrough + OAuth header inject)
+                          active session = glm (Claude Code)        │
+                          ──────────────────────────────────────────► HTTPS open.bigmodel.cn/api/anthropic
+                                                                    │   (Anthropic-compatible passthrough)
                           active session = openai (Claude Code)     │
                           ──────────────────────────────────────────► WSS chatgpt.com/backend-api/codex/responses
                                                                     │   (translate request, stream back as SSE)
@@ -46,6 +50,29 @@ The proxy is a Node.js HTTP server (`node:http`) with an attached `ws.WebSocketS
 ---
 
 ## Translation layer design
+
+## Provider expansion model
+
+The proxy now has two distinct expansion patterns:
+
+1. **New transport family**
+   - Example: `openai`
+   - Claude Code traffic must be translated from Anthropic Messages to OpenAI Responses
+   - Codex CLI traffic uses a separate WebSocket bridge
+
+2. **Provider preset on an existing transport family**
+   - Example: `glm`
+   - GLM Coding Plan exposes a Claude-compatible endpoint at `https://open.bigmodel.cn/api/anthropic`
+   - Claude Code traffic can stay on the existing Anthropic-compatible passthrough path
+   - No new translation layer is required for the first MVP cut
+
+This distinction is important for future roadmap decisions: not every provider addition should be treated like a new protocol integration.
+
+There is also an important control-plane distinction for GLM-style providers:
+
+- A provider may expose a direct Claude-compatible setup that maps Claude-facing model slots such as Opus, Sonnet, and Haiku onto provider-defined backend models.
+- `llm-switcher` should not rely on that mapping as the primary user model.
+- Instead, provider selection and model selection should remain explicit in the local session layer so users can still switch cleanly between GLM, GPT, and real Claude sessions.
 
 ### Request mapping: Anthropic Messages → OpenAI Responses API
 

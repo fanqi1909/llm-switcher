@@ -76,22 +76,23 @@ program
 program
   .command("add <name>")
   .description("Add a new LLM session")
-  .requiredOption("-p, --provider <provider>", "Provider: anthropic or openai")
+  .requiredOption("-p, --provider <provider>", "Provider: anthropic, openai, or glm")
   .requiredOption("-t, --token <token>", "API token or OAuth token")
   .option("-b, --base-url <url>", "Custom API base URL")
   .option("-m, --model <model>", "Model override")
   .action((name, opts) => {
-    if (!["anthropic", "openai"].includes(opts.provider)) {
-      console.error("Error: provider must be 'anthropic' or 'openai'");
+    if (!["anthropic", "openai", "glm"].includes(opts.provider)) {
+      console.error("Error: provider must be 'anthropic', 'openai', or 'glm'");
       process.exit(1);
     }
+    const provider = opts.provider as "anthropic" | "openai" | "glm";
     // Try HTTP first, fall back to direct config
     tryHttp("POST", "/admin/sessions", {
-      name, provider: opts.provider, token: opts.token,
+      name, provider, token: opts.token,
       base_url: opts.baseUrl, model_override: opts.model,
     }).then((ok) => {
-      if (!ok) addSession(name, opts.provider, opts.token, opts.baseUrl, opts.model);
-      console.log(`\u2713 Added session '${name}' (${opts.provider})`);
+      if (!ok) addSession(name, provider, opts.token, opts.baseUrl, opts.model);
+      console.log(`\u2713 Added session '${name}' (${provider})`);
     });
   });
 
