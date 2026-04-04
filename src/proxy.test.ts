@@ -160,11 +160,11 @@ describe("proxy HTTP routes", () => {
     });
   });
 
-  it("returns 503 for /v1/models without an active openai session", async () => {
+  it("returns 503 for /v1/models without an active session", async () => {
     await withServer(async (baseUrl) => {
       const res = await request(baseUrl, "/v1/models");
       assert.equal(res.status, 503);
-      assert.deepEqual(JSON.parse(res.text), { error: "No active OpenAI session" });
+      assert.deepEqual(JSON.parse(res.text), { error: "No active session" });
     });
   });
 
@@ -469,6 +469,42 @@ describe("proxy HTTP routes", () => {
       assert.equal(fetchCalls[0].url, "https://models.example.test/v1/models?limit=1");
       const body = JSON.parse(res.text);
       assert.equal(body.data[0].id, "gpt-5.4");
+    });
+  });
+
+  it("proxies /v1/models through the active anthropic session", async () => {
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const proxy = createProxyServer({
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(JSON.stringify({ data: [{ id: "claude-sonnet-4-5" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-work",
+          provider: "anthropic",
+          token: "sk-ant-test",
+          base_url: "https://models.anthropic.test",
+        }),
+      });
+
+      const res = await request(baseUrl, "/v1/models");
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("x-llm-session-used"), "claude-work");
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, "https://models.anthropic.test/v1/models");
+      const headers = fetchCalls[0].init?.headers as Record<string, string>;
+      assert.equal(headers["x-api-key"], "sk-ant-test");
+      const body = JSON.parse(res.text);
+      assert.equal(body.data[0].id, "claude-sonnet-4-5");
     });
   });
 

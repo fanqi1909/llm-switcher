@@ -133,6 +133,33 @@ program
     }
   });
 
+// --- models ---
+program
+  .command("models [name]")
+  .description("List available models for the active or named session")
+  .action(async (name) => {
+    const headers = name ? { "x-llm-session": name } : undefined;
+    const result = await tryHttp("GET", "/v1/models", undefined, headers);
+
+    if (!result?.data || !Array.isArray(result.data)) {
+      console.error(
+        name
+          ? `Error: Unable to fetch models for session '${name}'. Make sure it exists and is supported.`
+          : "Error: Unable to fetch models. Make sure there is an active session.",
+      );
+      process.exit(1);
+    }
+
+    if (result.data.length === 0) {
+      console.log("No models returned.");
+      return;
+    }
+
+    for (const model of result.data) {
+      if (model?.id) console.log(model.id);
+    }
+  });
+
 // --- switch ---
 program
   .command("switch <name>")
@@ -210,11 +237,19 @@ program
   });
 
 // --- HTTP helper ---
-async function tryHttp(method: string, path: string, body?: any): Promise<any> {
+async function tryHttp(
+  method: string,
+  path: string,
+  body?: any,
+  extraHeaders?: Record<string, string>,
+): Promise<any> {
   try {
     const res = await fetch(`http://localhost:8411${path}`, {
       method,
-      headers: body ? { "content-type": "application/json" } : undefined,
+      headers: {
+        ...(body ? { "content-type": "application/json" } : {}),
+        ...(extraHeaders || {}),
+      },
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(3000),
     });
