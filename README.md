@@ -107,6 +107,7 @@ llm-switcher codex-login gpt-work
 llm-switcher set-model claude claude-sonnet-4-5
 llm-switcher set-model gpt-work gpt-5.4
 llm-switcher serve
+llm-switcher configure-claude
 ```
 
 If you want Claude to expose `/llm-switch` outside this repo:
@@ -147,6 +148,12 @@ For Claude Code:
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8411
 claude
+```
+
+Or let `llm-switcher` update Claude's settings for you after checking that the local proxy is healthy:
+
+```bash
+llm-switcher configure-claude
 ```
 
 For Codex CLI, add this to `~/.codex/config.toml`:
@@ -208,6 +215,7 @@ llm-switcher set-model gpt-work gpt-5.4
 | `status` | Show the active session and latest quota info |
 | `statusline [--json]` | Render provider-aware statusline text from Claude-style stdin JSON |
 | `install-claude-command [--dir path]` | Install `/llm-switch` into Claude's commands directory |
+| `configure-claude [--settings path] [--proxy-url url]` | Safely point Claude Code at the local llm-switcher proxy |
 
 When the proxy is running, management commands go through `http://localhost:8411/admin/*`. If it is not running, the CLI falls back to editing local config directly.
 
