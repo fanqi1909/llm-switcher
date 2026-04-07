@@ -708,6 +708,40 @@ describe("proxy HTTP routes", () => {
     }
   });
 
+  it("returns upstream error as JSON (not SSE) for streaming requests so Claude Code does not hang", async () => {
+    const proxy = createProxyServer({
+      fetchImpl: async () => {
+        return new Response(
+          JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Rate limit exceeded" } }),
+          { status: 429, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-work",
+          provider: "anthropic",
+          token: "sk-ant-test",
+        }),
+      });
+
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      assert.equal(res.status, 429);
+      assert.equal(res.headers.get("content-type"), "application/json");
+      const body = JSON.parse(await res.text());
+      assert.equal(body.error.type, "rate_limit_error");
+    });
+  });
+
   it("returns 502 when the openai websocket emits an error", async () => {
     class FakeErrorSocket extends EventEmitter {
       send(_data: string): void {}
@@ -858,6 +892,75 @@ describe("proxy admin routes", () => {
 
       assert.equal(res.status, 404);
       assert.match(res.text, /not found/);
+    });
+  });
+
+  it("GET /admin/rate-limits pings each session and returns ok status + rate-limit headers", async () => {
+    const fetchCalls: Array<{ url: string; method?: string }> = [];
+    const proxy = createProxyServer({
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url: String(url), method: (init as RequestInit)?.method ?? "POST" });
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-ratelimit-remaining": "999",
+          },
+        });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-work",
+          provider: "anthropic",
+          token: "sk-ant-test",
+          base_url: "https://api.anthropic.test",
+        }),
+      });
+
+      const res = await request(baseUrl, "/admin/rate-limits");
+      assert.equal(res.status, 200);
+
+      // One ping fired per session
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, "https://api.anthropic.test/v1/models");
+      assert.equal(fetchCalls[0].method, "GET");
+
+      const body = JSON.parse(res.text);
+      assert.equal(body.rate_limits["claude-work"].ok, true);
+      assert.equal(body.rate_limits["claude-work"].status, 200);
+      assert.equal(body.rate_limits["claude-work"].rate_limits["x-ratelimit-remaining"], "999");
+    });
+  });
+
+  it("GET /admin/rate-limits marks session not-ok when ping returns 4xx", async () => {
+    const proxy = createProxyServer({
+      fetchImpl: async () => {
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-bad",
+          provider: "anthropic",
+          token: "sk-ant-expired",
+        }),
+      });
+
+      const res = await request(baseUrl, "/admin/rate-limits");
+      assert.equal(res.status, 200);
+
+      const body = JSON.parse(res.text);
+      assert.equal(body.rate_limits["claude-bad"].ok, false);
+      assert.equal(body.rate_limits["claude-bad"].status, 401);
     });
   });
 });
