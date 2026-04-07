@@ -371,8 +371,32 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
   res.setHeader("content-type", "application/json");
 
   // GET /admin/sessions
-  if (req.method === "GET" && path === "/admin/sessions") {
-    res.end(JSON.stringify(listSessions()));
+  if (req.method === "GET" && (path === "/admin/sessions" || path.startsWith("/admin/sessions?"))) {
+    const { sessions, active_session } = listSessions();
+    const wantHealth = new URL(req.url || "/", "http://127.0.0.1").searchParams.get("health") === "true";
+    let annotatedSessions: Record<string, any> = sessions;
+    if (wantHealth) {
+      const health: Record<string, { ok: boolean; status: number }> = {};
+      await Promise.all(
+        Object.entries(sessions).map(async ([name, session]) => {
+          const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
+          const headers = session.provider === "openai"
+            ? buildCodexHeaders(session.token, (session as any).account_id || "")
+            : buildUpstreamHeaders(session.token, {});
+          try {
+            const upstreamRes = await deps.fetchImpl(`${baseUrl}/v1/models`, { method: "GET", headers });
+            updateRateLimits(name, upstreamRes.headers);
+            health[name] = { ok: upstreamRes.ok, status: upstreamRes.status };
+          } catch {
+            health[name] = { ok: false, status: 0 };
+          }
+        }),
+      );
+      annotatedSessions = Object.fromEntries(
+        Object.entries(sessions).map(([name, session]) => [name, { ...session, ...health[name] }]),
+      );
+    }
+    res.end(JSON.stringify({ sessions: annotatedSessions, active_session }));
     return;
   }
 

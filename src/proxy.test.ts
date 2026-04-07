@@ -895,6 +895,60 @@ describe("proxy admin routes", () => {
     });
   });
 
+  it("GET /admin/sessions without ?health=true returns sessions without pinging upstream", async () => {
+    let fetchCalled = false;
+    const proxy = createProxyServer({
+      fetchImpl: async () => {
+        fetchCalled = true;
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "claude-work", provider: "anthropic", token: "sk-ant-test" }),
+      });
+
+      const res = await request(baseUrl, "/admin/sessions");
+      assert.equal(res.status, 200);
+      assert.equal(fetchCalled, false, "should not ping upstream without ?health=true");
+      const body = JSON.parse(res.text);
+      assert.equal(body.sessions["claude-work"].ok, undefined);
+    });
+  });
+
+  it("GET /admin/sessions?health=true pings each session and includes ok/status", async () => {
+    const proxy = createProxyServer({
+      fetchImpl: async (url) => {
+        const status = String(url).includes("anthropic") ? 200 : 401;
+        return new Response("{}", { status });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "claude-work", provider: "anthropic", token: "sk-ant-test", base_url: "https://api.anthropic.test" }),
+      });
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "gpt-bad", provider: "openai", token: "sk-expired", model_override: "gpt-5.4", base_url: "https://api.openai.test" }),
+      });
+
+      const res = await request(baseUrl, "/admin/sessions?health=true");
+      assert.equal(res.status, 200);
+      const body = JSON.parse(res.text);
+      assert.equal(body.sessions["claude-work"].ok, true);
+      assert.equal(body.sessions["claude-work"].status, 200);
+      assert.equal(body.sessions["gpt-bad"].ok, false);
+      assert.equal(body.sessions["gpt-bad"].status, 401);
+    });
+  });
+
   it("GET /admin/rate-limits pings each session and returns ok status + rate-limit headers", async () => {
     const fetchCalls: Array<{ url: string; method?: string }> = [];
     const proxy = createProxyServer({
