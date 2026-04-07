@@ -374,7 +374,9 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
   if (req.method === "GET" && (path === "/admin/sessions" || path.startsWith("/admin/sessions?"))) {
     const { sessions, active_session } = listSessions();
     const wantHealth = new URL(req.url || "/", "http://127.0.0.1").searchParams.get("health") === "true";
-    let annotatedSessions: Record<string, any> = sessions;
+    const stripTokens = (s: Record<string, any>) =>
+      Object.fromEntries(Object.entries(s).map(([n, v]) => { const { token, ...safe } = v; return [n, safe]; }));
+    let annotatedSessions: Record<string, any> = stripTokens(sessions);
     if (wantHealth) {
       const health: Record<string, { ok: boolean; status: number }> = {};
       await Promise.all(
@@ -393,7 +395,10 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
         }),
       );
       annotatedSessions = Object.fromEntries(
-        Object.entries(sessions).map(([name, session]) => [name, { ...session, ...health[name] }]),
+        Object.entries(sessions).map(([name, session]) => {
+          const { token, ...safe } = session;
+          return [name, { ...safe, ...health[name] }];
+        }),
       );
     }
     res.end(JSON.stringify({ sessions: annotatedSessions, active_session }));

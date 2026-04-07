@@ -820,6 +820,8 @@ describe("proxy admin routes", () => {
       assert.equal(listed.active_session, "claude-work");
       assert.equal(listed.sessions["claude-work"].provider, "anthropic");
       assert.equal(listed.sessions["gpt-work"].provider, "openai");
+      assert.equal(listed.sessions["claude-work"].token, undefined, "token must not be exposed");
+      assert.equal(listed.sessions["gpt-work"].token, undefined, "token must not be exposed");
 
       const statusBefore = await request(baseUrl, "/admin/status");
       assert.equal(statusBefore.status, 200);
