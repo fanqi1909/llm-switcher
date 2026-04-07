@@ -86,6 +86,16 @@ function updateRateLimits(sessionName: string, headers: Headers): void {
   if (Object.keys(info).length > 0) rateLimits[sessionName] = info;
 }
 
+// --- Per-chat session binding ---
+// Maps x-claude-code-session-id → llm session name, so each chat window can use a different session.
+const chatSessionMap: Record<string, string> = {};
+let lastSeenChatSessionId: string | null = null;
+
+function getChatSessionId(req: IncomingMessage): string | null {
+  const val = req.headers["x-claude-code-session-id"];
+  return typeof val === "string" && val.trim() ? val.trim() : null;
+}
+
 function getScopedSession(name: string | null | undefined) {
   if (!name) return getActiveSession();
   const { sessions } = listSessions();
@@ -129,7 +139,14 @@ async function handleProxy(
     return;
   }
 
-  const requestedSession = getRequestedSessionName(req);
+  // Track the chat session ID for per-chat binding
+  const chatSessionId = getChatSessionId(req);
+  if (chatSessionId) lastSeenChatSessionId = chatSessionId;
+
+  // Session resolution order: explicit x-llm-session header > per-chat binding > global active
+  const requestedSession = getRequestedSessionName(req)
+    ?? (chatSessionId ? chatSessionMap[chatSessionId] : undefined)
+    ?? null;
   const session = getScopedSession(requestedSession);
   if (!session) {
     res.writeHead(requestedSession ? 404 : 503, { "content-type": "application/json" });
@@ -416,6 +433,53 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
       override_ws_param: "?session=<name>",
       rate_limits: rateLimits[session.name] || {},
     }));
+    return;
+  }
+
+  // POST /admin/chat-bind/:chat-session-id/:session-name
+  if (req.method === "POST" && path.startsWith("/admin/chat-bind/")) {
+    const rest = path.slice("/admin/chat-bind/".length);
+    const slashIdx = rest.indexOf("/");
+    if (slashIdx === -1) {
+      res.writeHead(422);
+      res.end(JSON.stringify({ error: "Expected /admin/chat-bind/:chat-session-id/:session-name" }));
+      return;
+    }
+    const chatId = decodeURIComponent(rest.slice(0, slashIdx));
+    const sessionName = decodeURIComponent(rest.slice(slashIdx + 1));
+    const { sessions } = listSessions();
+    if (!sessions[sessionName]) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: `Session '${sessionName}' not found.` }));
+      return;
+    }
+    chatSessionMap[chatId] = sessionName;
+    res.end(JSON.stringify({ status: "ok", message: `Chat '${chatId}' bound to session '${sessionName}'.` }));
+    return;
+  }
+
+  // DELETE /admin/chat-bind/:chat-session-id
+  if (req.method === "DELETE" && path.startsWith("/admin/chat-bind/")) {
+    const chatId = decodeURIComponent(path.slice("/admin/chat-bind/".length));
+    delete chatSessionMap[chatId];
+    res.end(JSON.stringify({ status: "ok", message: `Chat '${chatId}' unbound.` }));
+    return;
+  }
+
+  // GET /admin/chat-sessions
+  if (req.method === "GET" && path === "/admin/chat-sessions") {
+    res.end(JSON.stringify({ chat_sessions: chatSessionMap, last_seen_chat_id: lastSeenChatSessionId }));
+    return;
+  }
+
+  // GET /admin/recent-chat-id
+  if (req.method === "GET" && path === "/admin/recent-chat-id") {
+    if (!lastSeenChatSessionId) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: "No chat session seen yet." }));
+      return;
+    }
+    res.end(JSON.stringify({ chat_session_id: lastSeenChatSessionId }));
     return;
   }
 

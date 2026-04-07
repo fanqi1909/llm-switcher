@@ -8,13 +8,6 @@ import { startServer } from "./proxy.js";
 import { sniffOAuthToken } from "./login.js";
 import { renderClaudeStatusline } from "./statusline.js";
 import { getDefaultClaudeCommandsDir, installClaudeCommand } from "./claude-command.js";
-import {
-  applyClaudeProxyConfig,
-  assertLocalProxyHealthy,
-  getDefaultClaudeSettingsPath,
-  readClaudeSettings,
-  writeClaudeSettings,
-} from "./claude-proxy-config.js";
 import { getFallbackModels, shouldUseFallbackModels } from "./models.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -326,29 +319,6 @@ program
     const targetDir = opts.dir || getDefaultClaudeCommandsDir();
     const targetPath = installClaudeCommand(targetDir);
     console.log(`✓ Installed Claude command at ${targetPath}`);
-  });
-
-// --- configure-claude ---
-program
-  .command("configure-claude")
-  .description("Configure Claude Code to use the local llm-switcher proxy")
-  .option("--settings <path>", "Path to Claude settings.json")
-  .option("--proxy-url <url>", "Local llm-switcher URL", "http://127.0.0.1:8411")
-  .action(async (opts) => {
-    try {
-      await assertLocalProxyHealthy(opts.proxyUrl);
-    } catch (e: any) {
-      console.error(`Error: ${e.message}`);
-      process.exit(1);
-    }
-
-    const settingsPath = opts.settings || getDefaultClaudeSettingsPath();
-    const current = readClaudeSettings(settingsPath);
-    const next = applyClaudeProxyConfig(current, opts.proxyUrl);
-    writeClaudeSettings(settingsPath, next);
-
-    console.log(`✓ Claude configured to use llm-switcher at ${opts.proxyUrl}`);
-    console.log(`✓ Updated ${settingsPath}`);
   });
 
 // --- HTTP helper ---

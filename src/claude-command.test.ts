@@ -27,8 +27,8 @@ describe("claude command installer", () => {
 
   it("reads the tracked repo command when present", () => {
     const markdown = getClaudeCommandMarkdown(join(process.cwd()));
-    assert.match(markdown, /Switch LLM session via the llm-switcher proxy/);
-    assert.match(markdown, /admin\/switch/);
+    assert.match(markdown, /llm-switcher proxy/);
+    assert.match(markdown, /admin\/chat-bind/);
   });
 
   it("installs llm-switch.md into the target commands directory", () => {
