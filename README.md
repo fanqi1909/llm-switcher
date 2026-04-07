@@ -107,7 +107,12 @@ llm-switcher codex-login gpt-work
 llm-switcher set-model claude claude-sonnet-4-5
 llm-switcher set-model gpt-work gpt-5.4
 llm-switcher serve
-llm-switcher configure-claude
+```
+
+Then point Claude Code at the proxy (one-time, per terminal or in your shell profile):
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8411
 ```
 
 If you want Claude to expose `/llm-switch` outside this repo:
@@ -148,12 +153,6 @@ For Claude Code:
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8411
 claude
-```
-
-Or let `llm-switcher` update Claude's settings for you after checking that the local proxy is healthy:
-
-```bash
-llm-switcher configure-claude
 ```
 
 For Codex CLI, add this to `~/.codex/config.toml`:
@@ -215,7 +214,6 @@ llm-switcher set-model gpt-work gpt-5.4
 | `status` | Show the active session and latest quota info |
 | `statusline [--json]` | Render provider-aware statusline text from Claude-style stdin JSON |
 | `install-claude-command [--dir path]` | Install `/llm-switch` into Claude's commands directory |
-| `configure-claude [--settings path] [--proxy-url url]` | Safely point Claude Code at the local llm-switcher proxy |
 
 When the proxy is running, management commands go through `http://localhost:8411/admin/*`. If it is not running, the CLI falls back to editing local config directly.
 
@@ -262,15 +260,30 @@ Session identity and model selection are intentionally separate:
 
 If a provider blocks model listing for your current token, `models [name]` falls back to a built-in provider-specific suggestion list instead of failing silently.
 
-By default, `llm-switcher` uses a **global active session** model: one local switch affects all clients connected to the proxy.
+By default, `llm-switcher` uses a **global active session**: all clients connected to the proxy share the same backend unless you override it.
 
-For more advanced local workflows, you can also override the default session per request or per WebSocket connection.
+### Per-Chat Session Binding (Claude Code)
 
-### Scoped Session Selection
+Each Claude Code chat window carries a unique `x-claude-code-session-id` on every request. The proxy uses this to let you bind individual chat windows to different sessions — so Chat A can run Opus while Chat B runs GPT, without affecting each other.
 
-Use a scoped override when you want one local lane pinned differently from the global default.
+Use the `/llm-switch` Claude command inside any chat window:
 
-For HTTP requests:
+```
+/llm-switch opus
+/llm-switch gpt-work
+```
+
+This binds only the current window. Other windows keep whatever session they are already using.
+
+To install `/llm-switch` as a global Claude command (available outside this repo):
+
+```bash
+llm-switcher install-claude-command
+```
+
+### Scoped Session Selection (HTTP / WebSocket)
+
+For direct HTTP requests, you can also pin a session per request with a header:
 
 ```http
 x-llm-session: gpt-work
@@ -282,7 +295,7 @@ For Codex WebSocket connections:
 /responses?session=gpt-work
 ```
 
-If no scoped session is provided, the proxy uses the current global active session.
+Session resolution order: `x-llm-session` header → per-chat binding → global active session.
 
 `x-llm-switch-session` is still accepted as a compatibility alias, but `x-llm-session` is the preferred header going forward.
 
@@ -292,7 +305,7 @@ For proxied HTTP requests, the response includes:
 x-llm-session-used: <session-name>
 ```
 
-This makes it easy to verify which session actually handled a request when you are using scoped overrides.
+This makes it easy to verify which session actually handled a request.
 
 For Claude Code custom statusline integration, `llm-switcher statusline` reads the statusline JSON payload on stdin and resolves proxy state from the current process env before falling back to proxy-global defaults.
 
@@ -316,7 +329,7 @@ For implementation details, protocol mapping, and event flow, see [docs/design.m
 ## Current Limitations
 
 - **Codex CLI -> Anthropic is not implemented**
-- **The default session is still global.** Scoped overrides exist, but the main `switch` command still changes the default backend for all clients that do not explicitly pin a session.
+- **The global active session is shared** across all clients that do not have an explicit per-chat binding or `x-llm-session` header.
 - **Claude Code -> OpenAI is a translation layer**, so some Anthropic-native features do not map perfectly
 - **`max_output_tokens`, `temperature`, and `top_p` are stripped** for the Codex backend because that backend does not support them
 - **OAuth tokens expire**, so `login` / `codex-login` may need to be re-run
