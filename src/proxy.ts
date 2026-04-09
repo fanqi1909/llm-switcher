@@ -193,8 +193,8 @@ async function handleProxy(
 
     updateRateLimits(session.name, upstreamRes.headers);
 
-    if (isStream && upstreamRes.body) {
-      // Stream SSE passthrough
+    if (isStream && upstreamRes.ok && upstreamRes.body) {
+      // Stream SSE passthrough (only for successful responses)
       res.writeHead(upstreamRes.status, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
@@ -210,7 +210,7 @@ async function handleProxy(
       }
       res.end();
     } else {
-      // JSON passthrough
+      // JSON passthrough (errors always returned as JSON so Claude Code doesn't hang)
       const responseBody = await upstreamRes.text();
       res.writeHead(upstreamRes.status, {
         "content-type": "application/json",
@@ -367,12 +367,41 @@ async function handleModels(
   }
 }
 
-async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
+async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: string, deps: Required<ProxyDeps>): Promise<void> {
   res.setHeader("content-type", "application/json");
 
   // GET /admin/sessions
-  if (req.method === "GET" && path === "/admin/sessions") {
-    res.end(JSON.stringify(listSessions()));
+  if (req.method === "GET" && (path === "/admin/sessions" || path.startsWith("/admin/sessions?"))) {
+    const { sessions, active_session } = listSessions();
+    const wantHealth = new URL(req.url || "/", "http://127.0.0.1").searchParams.get("health") === "true";
+    const stripTokens = (s: Record<string, any>) =>
+      Object.fromEntries(Object.entries(s).map(([n, v]) => { const { token, ...safe } = v; return [n, safe]; }));
+    let annotatedSessions: Record<string, any> = stripTokens(sessions);
+    if (wantHealth) {
+      const health: Record<string, { ok: boolean; status: number }> = {};
+      await Promise.all(
+        Object.entries(sessions).map(async ([name, session]) => {
+          const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
+          const headers = session.provider === "openai"
+            ? buildCodexHeaders(session.token, (session as any).account_id || "")
+            : buildUpstreamHeaders(session.token, {});
+          try {
+            const upstreamRes = await deps.fetchImpl(`${baseUrl}/v1/models`, { method: "GET", headers });
+            updateRateLimits(name, upstreamRes.headers);
+            health[name] = { ok: upstreamRes.ok, status: upstreamRes.status };
+          } catch {
+            health[name] = { ok: false, status: 0 };
+          }
+        }),
+      );
+      annotatedSessions = Object.fromEntries(
+        Object.entries(sessions).map(([name, session]) => {
+          const { token, ...safe } = session;
+          return [name, { ...safe, ...health[name] }];
+        }),
+      );
+    }
+    res.end(JSON.stringify({ sessions: annotatedSessions, active_session }));
     return;
   }
 
@@ -472,6 +501,33 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
     return;
   }
 
+  // GET /admin/rate-limits
+  // Pings each session with GET /v1/models (no tokens consumed) to refresh rate-limit headers.
+  if (req.method === "GET" && path === "/admin/rate-limits") {
+    const { sessions } = listSessions();
+    const result: Record<string, { ok: boolean; status: number; rate_limits: Record<string, string> }> = {};
+
+    await Promise.all(
+      Object.entries(sessions).map(async ([name, session]) => {
+        const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
+        const url = `${baseUrl}/v1/models`;
+        const headers = session.provider === "openai"
+          ? buildCodexHeaders(session.token, (session as any).account_id || "")
+          : buildUpstreamHeaders(session.token, {});
+        try {
+          const upstreamRes = await deps.fetchImpl(url, { method: "GET", headers });
+          updateRateLimits(name, upstreamRes.headers);
+          result[name] = { ok: upstreamRes.ok, status: upstreamRes.status, rate_limits: rateLimits[name] || {} };
+        } catch {
+          result[name] = { ok: false, status: 0, rate_limits: rateLimits[name] || {} };
+        }
+      }),
+    );
+
+    res.end(JSON.stringify({ rate_limits: result }));
+    return;
+  }
+
   // GET /admin/recent-chat-id
   if (req.method === "GET" && path === "/admin/recent-chat-id") {
     if (!lastSeenChatSessionId) {
@@ -519,7 +575,7 @@ export function createProxyServer(overrides: ProxyDeps = {}) {
 
     // Admin routes
     if (url.startsWith("/admin/")) {
-      return handleAdmin(req, res, url);
+      return handleAdmin(req, res, url, deps);
     }
 
     res.writeHead(404, { "content-type": "application/json" });
