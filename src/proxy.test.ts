@@ -1126,8 +1126,12 @@ describe("proxy admin routes", () => {
       assert.equal(body.sessions["claude-oauth"].ok, null);
       assert.equal(body.sessions["claude-oauth"].status, null);
       assert.equal(body.sessions["claude-oauth"].reason, "models_probe_unsupported_for_anthropic_oauth");
+      assert.equal(body.sessions["claude-oauth"].health_state, "unknown");
+      assert.match(body.sessions["claude-oauth"].health_message, /Health unknown/);
       assert.equal(body.sessions["gpt-bad"].ok, false);
       assert.equal(body.sessions["gpt-bad"].status, 401);
+      assert.equal(body.sessions["gpt-bad"].health_state, "unhealthy");
+      assert.equal(body.sessions["gpt-bad"].health_message, "Unhealthy: HTTP 401");
     });
   });
 
@@ -1180,8 +1184,12 @@ describe("proxy admin routes", () => {
       assert.equal(body.rate_limits["claude-oauth"].ok, null);
       assert.equal(body.rate_limits["claude-oauth"].status, null);
       assert.equal(body.rate_limits["claude-oauth"].reason, "models_probe_unsupported_for_anthropic_oauth");
+      assert.equal(body.rate_limits["claude-oauth"].health_state, "unknown");
+      assert.match(body.rate_limits["claude-oauth"].health_message, /Health unknown/);
       assert.equal(body.rate_limits["gpt-work"].ok, true);
       assert.equal(body.rate_limits["gpt-work"].status, 200);
+      assert.equal(body.rate_limits["gpt-work"].health_state, "healthy");
+      assert.equal(body.rate_limits["gpt-work"].health_message, "Healthy");
       assert.equal(body.rate_limits["gpt-work"].rate_limits["x-ratelimit-remaining"], "999");
     });
   });

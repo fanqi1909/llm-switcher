@@ -577,11 +577,23 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
       Object.entries(sessions).map(([name, session]) => [name, getSessionAdminView(name, session)]),
     );
     if (wantHealth) {
-      const health: Record<string, { ok: boolean | null; status: number | null; reason?: string }> = {};
+      const health: Record<string, {
+        ok: boolean | null;
+        status: number | null;
+        reason?: string;
+        health_state: "healthy" | "unhealthy" | "unknown";
+        health_message: string;
+      }> = {};
       await Promise.all(
         Object.entries(sessions).map(async ([name, session]) => {
           if (!supportsModelsHealthProbe(session)) {
-            health[name] = { ok: null, status: null, reason: "models_probe_unsupported_for_anthropic_oauth" };
+            health[name] = {
+              ok: null,
+              status: null,
+              reason: "models_probe_unsupported_for_anthropic_oauth",
+              health_state: "unknown",
+              health_message: "Health unknown: models probe unsupported for Anthropic OAuth",
+            };
             return;
           }
           const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
@@ -591,9 +603,19 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
           try {
             const upstreamRes = await deps.fetchImpl(`${baseUrl}/v1/models`, { method: "GET", headers });
             updateRateLimits(name, upstreamRes.headers);
-            health[name] = { ok: upstreamRes.ok, status: upstreamRes.status };
+            health[name] = {
+              ok: upstreamRes.ok,
+              status: upstreamRes.status,
+              health_state: upstreamRes.ok ? "healthy" : "unhealthy",
+              health_message: upstreamRes.ok ? "Healthy" : `Unhealthy: HTTP ${upstreamRes.status}`,
+            };
           } catch {
-            health[name] = { ok: false, status: 0 };
+            health[name] = {
+              ok: false,
+              status: 0,
+              health_state: "unhealthy",
+              health_message: "Unhealthy: probe failed",
+            };
           }
         }),
       );
@@ -707,7 +729,14 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
   // Pings each session with GET /v1/models (no tokens consumed) to refresh rate-limit headers.
   if (req.method === "GET" && path === "/admin/rate-limits") {
     const { sessions } = listSessions();
-    const result: Record<string, { ok: boolean | null; status: number | null; rate_limits: Record<string, string>; reason?: string }> = {};
+    const result: Record<string, {
+      ok: boolean | null;
+      status: number | null;
+      rate_limits: Record<string, string>;
+      reason?: string;
+      health_state: "healthy" | "unhealthy" | "unknown";
+      health_message: string;
+    }> = {};
 
     await Promise.all(
       Object.entries(sessions).map(async ([name, session]) => {
@@ -717,6 +746,8 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
             status: null,
             rate_limits: rateLimits[name] || {},
             reason: "models_probe_unsupported_for_anthropic_oauth",
+            health_state: "unknown",
+            health_message: "Health unknown: models probe unsupported for Anthropic OAuth",
           };
           return;
         }
@@ -728,9 +759,21 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
         try {
           const upstreamRes = await deps.fetchImpl(url, { method: "GET", headers });
           updateRateLimits(name, upstreamRes.headers);
-          result[name] = { ok: upstreamRes.ok, status: upstreamRes.status, rate_limits: rateLimits[name] || {} };
+          result[name] = {
+            ok: upstreamRes.ok,
+            status: upstreamRes.status,
+            rate_limits: rateLimits[name] || {},
+            health_state: upstreamRes.ok ? "healthy" : "unhealthy",
+            health_message: upstreamRes.ok ? "Healthy" : `Unhealthy: HTTP ${upstreamRes.status}`,
+          };
         } catch {
-          result[name] = { ok: false, status: 0, rate_limits: rateLimits[name] || {} };
+          result[name] = {
+            ok: false,
+            status: 0,
+            rate_limits: rateLimits[name] || {},
+            health_state: "unhealthy",
+            health_message: "Unhealthy: probe failed",
+          };
         }
       }),
     );
