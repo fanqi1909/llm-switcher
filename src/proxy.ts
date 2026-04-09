@@ -74,16 +74,156 @@ function getUpstreamUrl(baseUrl: string): string {
   return `${baseUrl}/v1/messages`;
 }
 
-// --- Rate limit tracking ---
+// --- Runtime observability tracking ---
 const rateLimits: Record<string, Record<string, string>> = {};
 
-function updateRateLimits(sessionName: string, headers: Headers): void {
+interface SessionUsageSnapshot {
+  input_tokens: number;
+  output_tokens: number;
+}
+
+interface SessionObservability {
+  configured_model: string | null;
+  last_requested_model: string | null;
+  last_effective_model: string | null;
+  last_used_at: string | null;
+  last_error: { type: string; message: string; status?: number } | null;
+  last_usage: SessionUsageSnapshot | null;
+  totals: {
+    input_tokens: number;
+    output_tokens: number;
+    requests: number;
+    errors: number;
+  };
+}
+
+interface SessionProbeStatus {
+  ok: boolean | null;
+  status: number | null;
+  reason?: string;
+  health_state: "healthy" | "unhealthy" | "unknown";
+  health_message: string;
+  checked_at: string | null;
+  latency_ms: number | null;
+  rate_limits: Record<string, string>;
+}
+
+const sessionObservability: Record<string, SessionObservability> = {};
+const sessionProbeStatus: Record<string, SessionProbeStatus> = {};
+
+export function resetRuntimeObservability(): void {
+  for (const key of Object.keys(rateLimits)) delete rateLimits[key];
+  for (const key of Object.keys(sessionObservability)) delete sessionObservability[key];
+  for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
+}
+
+function getSessionObservability(session: { name: string; model_override?: string | null }): SessionObservability {
+  if (!sessionObservability[session.name]) {
+    sessionObservability[session.name] = {
+      configured_model: session.model_override || null,
+      last_requested_model: null,
+      last_effective_model: null,
+      last_used_at: null,
+      last_error: null,
+      last_usage: null,
+      totals: {
+        input_tokens: 0,
+        output_tokens: 0,
+        requests: 0,
+        errors: 0,
+      },
+    };
+  }
+  sessionObservability[session.name].configured_model = session.model_override || null;
+  return sessionObservability[session.name];
+}
+
+function extractRateLimits(headers: Headers): Record<string, string> {
   const info: Record<string, string> = {};
   for (const key of ["x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"]) {
     const val = headers.get(key);
     if (val) info[key] = val;
   }
+  return info;
+}
+
+function updateRateLimits(sessionName: string, headers: Headers): void {
+  const info = extractRateLimits(headers);
   if (Object.keys(info).length > 0) rateLimits[sessionName] = info;
+}
+
+function recordSessionSuccess(
+  session: { name: string; model_override?: string | null },
+  data: {
+    requestedModel?: string | null;
+    effectiveModel?: string | null;
+    usage?: { input_tokens?: number; output_tokens?: number } | null;
+  },
+): void {
+  const snapshot = getSessionObservability(session);
+  snapshot.last_requested_model = data.requestedModel ?? snapshot.last_requested_model;
+  snapshot.last_effective_model = data.effectiveModel ?? snapshot.last_effective_model;
+  snapshot.last_used_at = new Date().toISOString();
+  snapshot.last_error = null;
+  snapshot.totals.requests += 1;
+
+  if (data.usage) {
+    const input = data.usage.input_tokens || 0;
+    const output = data.usage.output_tokens || 0;
+    snapshot.last_usage = { input_tokens: input, output_tokens: output };
+    snapshot.totals.input_tokens += input;
+    snapshot.totals.output_tokens += output;
+  }
+}
+
+function recordSessionError(
+  session: { name: string; model_override?: string | null },
+  data: {
+    requestedModel?: string | null;
+    effectiveModel?: string | null;
+    type: string;
+    message: string;
+    status?: number;
+  },
+): void {
+  const snapshot = getSessionObservability(session);
+  snapshot.last_requested_model = data.requestedModel ?? snapshot.last_requested_model;
+  snapshot.last_effective_model = data.effectiveModel ?? snapshot.last_effective_model;
+  snapshot.last_used_at = new Date().toISOString();
+  snapshot.last_error = {
+    type: data.type,
+    message: data.message,
+    ...(data.status !== undefined ? { status: data.status } : {}),
+  };
+  snapshot.totals.errors += 1;
+}
+
+function sanitizeSession(session: Record<string, any>): Record<string, any> {
+  const { token, ...safe } = session;
+  return safe;
+}
+
+function getSessionAdminView(name: string, session: Record<string, any>): Record<string, any> {
+  return {
+    ...sanitizeSession(session),
+    ...getSessionObservability({ name, model_override: session.model_override }),
+  };
+}
+
+function getProbeStatus(sessionName: string): SessionProbeStatus {
+  return sessionProbeStatus[sessionName] || {
+    ok: null,
+    status: null,
+    health_state: "unknown",
+    health_message: "Health not checked yet",
+    checked_at: null,
+    latency_ms: null,
+    rate_limits: rateLimits[sessionName] || {},
+  };
+}
+
+function setProbeStatus(sessionName: string, status: SessionProbeStatus): void {
+  sessionProbeStatus[sessionName] = status;
 }
 
 // --- Per-chat session binding ---
@@ -165,6 +305,8 @@ async function handleProxy(
     return handleOpenAIProxy(res, body, session, deps);
   }
 
+  const requestedModel = typeof body.model === "string" ? body.model : null;
+
   const token = session.token;
   const baseUrl = session.base_url || "https://api.anthropic.com";
   const incomingHeaders: Record<string, string> = {};
@@ -185,6 +327,7 @@ async function handleProxy(
   const isStream = body.stream === true;
 
   try {
+    const effectiveModel = typeof body.model === "string" ? body.model : session.model_override || null;
     const upstreamRes = await deps.fetchImpl(upstreamUrl, {
       method: "POST",
       headers: upstreamHeaders,
@@ -194,6 +337,10 @@ async function handleProxy(
     updateRateLimits(session.name, upstreamRes.headers);
 
     if (isStream && upstreamRes.ok && upstreamRes.body) {
+      recordSessionSuccess(session, {
+        requestedModel,
+        effectiveModel,
+      });
       // Stream SSE passthrough (only for successful responses)
       res.writeHead(upstreamRes.status, {
         "content-type": "text/event-stream",
@@ -212,6 +359,39 @@ async function handleProxy(
     } else {
       // JSON passthrough (errors always returned as JSON so Claude Code doesn't hang)
       const responseBody = await upstreamRes.text();
+      try {
+        const parsed = JSON.parse(responseBody);
+        if (upstreamRes.ok) {
+          recordSessionSuccess(session, {
+            requestedModel,
+            effectiveModel: parsed.model || effectiveModel,
+            usage: parsed.usage || null,
+          });
+        } else {
+          recordSessionError(session, {
+            requestedModel,
+            effectiveModel,
+            type: parsed.error?.type || "api_error",
+            message: parsed.error?.message || `HTTP ${upstreamRes.status}`,
+            status: upstreamRes.status,
+          });
+        }
+      } catch {
+        if (upstreamRes.ok) {
+          recordSessionSuccess(session, {
+            requestedModel,
+            effectiveModel,
+          });
+        } else {
+          recordSessionError(session, {
+            requestedModel,
+            effectiveModel,
+            type: "api_error",
+            message: `HTTP ${upstreamRes.status}`,
+            status: upstreamRes.status,
+          });
+        }
+      }
       res.writeHead(upstreamRes.status, {
         "content-type": "application/json",
         ...sessionUsedHeader(session.name),
@@ -219,6 +399,13 @@ async function handleProxy(
       res.end(responseBody);
     }
   } catch (err: any) {
+    recordSessionError(session, {
+      requestedModel,
+      effectiveModel: typeof body.model === "string" ? body.model : session.model_override || null,
+      type: "upstream_connection_error",
+      message: err.message,
+      status: 502,
+    });
     res.writeHead(502, {
       "content-type": "application/json",
       ...sessionUsedHeader(session.name),
@@ -233,10 +420,18 @@ async function handleOpenAIProxy(
   session: any,
   deps: Required<ProxyDeps>,
 ): Promise<void> {
+  const requestedModel = typeof body.model === "string" ? body.model : null;
   let translated: { url: string; headers: Record<string, string>; body: string };
   try {
     translated = translateRequest(body, session);
   } catch (err: any) {
+    recordSessionError(session, {
+      requestedModel,
+      effectiveModel: session.model_override || null,
+      type: "invalid_request",
+      message: err.message,
+      status: 422,
+    });
     res.writeHead(422, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: { type: "invalid_request", message: err.message } }));
     return;
@@ -244,6 +439,7 @@ async function handleOpenAIProxy(
 
   const isStream = body.stream === true;
   const requestBody = JSON.parse(translated.body);
+  const effectiveModel = typeof requestBody.model === "string" ? requestBody.model : session.model_override || null;
   // Always stream over WebSocket, we'll collect if non-streaming was requested
   requestBody.stream = true;
 
@@ -290,6 +486,13 @@ async function handleOpenAIProxy(
 
     if (event.type === "error") {
       console.error(`[OpenAI] WS error event:`, JSON.stringify(event));
+      recordSessionError(session, {
+        requestedModel,
+        effectiveModel,
+        type: "api_error",
+        message: event.error?.message || "OpenAI error",
+        status: 502,
+      });
       endResponse(502, { error: { type: "api_error", message: event.error?.message || "OpenAI error" } });
       ws.close();
       return;
@@ -299,6 +502,11 @@ async function handleOpenAIProxy(
       processWsEvent(event, writeSSE);
 
       if (event.type === "response.completed") {
+        recordSessionSuccess(session, {
+          requestedModel,
+          effectiveModel: event.response?.model || effectiveModel,
+          usage: event.response?.usage || null,
+        });
         processWsEvent({ type: "_finish" }, writeSSE);
         responseDone = true;
         res.end();
@@ -309,6 +517,11 @@ async function handleOpenAIProxy(
 
       if (event.type === "response.completed") {
         const anthropicRes = translateResponse(event.response);
+        recordSessionSuccess(session, {
+          requestedModel,
+          effectiveModel: anthropicRes.model || event.response?.model || effectiveModel,
+          usage: anthropicRes.usage || null,
+        });
         endResponse(200, anthropicRes);
         ws.close();
       }
@@ -317,10 +530,26 @@ async function handleOpenAIProxy(
 
   ws.on("error", (err) => {
     console.error(`[OpenAI] WS connection error:`, err.message);
+    recordSessionError(session, {
+      requestedModel,
+      effectiveModel,
+      type: "upstream_connection_error",
+      message: err.message,
+      status: 502,
+    });
     endResponse(502, { error: { type: "upstream_connection_error", message: err.message } });
   });
 
   ws.on("close", (code, reason) => {
+    if (!responseDone) {
+      recordSessionError(session, {
+        requestedModel,
+        effectiveModel,
+        type: "upstream_connection_error",
+        message: `WebSocket closed: ${code} ${reason}`,
+        status: 502,
+      });
+    }
     endResponse(502, { error: { type: "upstream_connection_error", message: `WebSocket closed: ${code} ${reason}` } });
   });
 }
@@ -367,6 +596,158 @@ async function handleModels(
   }
 }
 
+async function runAnthropicProbe(session: any, deps: Required<ProxyDeps>): Promise<SessionProbeStatus> {
+  const startedAt = Date.now();
+  const token = session.token;
+  const baseUrl = session.base_url || "https://api.anthropic.com";
+  const headers = buildUpstreamHeaders(token, {});
+  const body = injectBillingHeader({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 1,
+    messages: [{ role: "user", content: "ping" }],
+  }, token);
+
+  try {
+    const upstreamRes = await deps.fetchImpl(getUpstreamUrl(baseUrl), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    const probeRateLimits = extractRateLimits(upstreamRes.headers);
+    if (Object.keys(probeRateLimits).length > 0) rateLimits[session.name] = probeRateLimits;
+    return {
+      ok: upstreamRes.ok,
+      status: upstreamRes.status,
+      health_state: upstreamRes.ok ? "healthy" : "unhealthy",
+      health_message: upstreamRes.ok ? "Healthy" : `Unhealthy: HTTP ${upstreamRes.status}`,
+      checked_at: new Date().toISOString(),
+      latency_ms: Date.now() - startedAt,
+      rate_limits: probeRateLimits,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: 0,
+      health_state: "unhealthy",
+      health_message: "Unhealthy: probe failed",
+      reason: err.message,
+      checked_at: new Date().toISOString(),
+      latency_ms: Date.now() - startedAt,
+      rate_limits: rateLimits[session.name] || {},
+    };
+  }
+}
+
+async function runOpenAIProbe(session: any, deps: Required<ProxyDeps>): Promise<SessionProbeStatus> {
+  const startedAt = Date.now();
+  let translated: { url: string; headers: Record<string, string>; body: string };
+  try {
+    translated = translateRequest({
+      model: "claude-haiku-4-5-20251001",
+      stream: false,
+      messages: [{ role: "user", content: "ping" }],
+    }, session);
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: 422,
+      health_state: "unhealthy",
+      health_message: `Unhealthy: ${err.message}`,
+      reason: err.message,
+      checked_at: new Date().toISOString(),
+      latency_ms: Date.now() - startedAt,
+      rate_limits: rateLimits[session.name] || {},
+    };
+  }
+
+  const requestBody = JSON.parse(translated.body);
+  requestBody.stream = true;
+
+  return await new Promise((resolve) => {
+    const ws = deps.openAIWsFactory(translated.url, { headers: translated.headers });
+    let done = false;
+    const finish = (status: SessionProbeStatus) => {
+      if (done) return;
+      done = true;
+      setProbeStatus(session.name, status);
+      resolve(status);
+    };
+
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ type: "response.create", ...requestBody }));
+    });
+
+    ws.on("message", (data) => {
+      let event: any;
+      try {
+        event = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+      if (event.type === "error") {
+        finish({
+          ok: false,
+          status: 502,
+          health_state: "unhealthy",
+          health_message: `Unhealthy: ${event.error?.message || "OpenAI error"}`,
+          reason: event.error?.message || "OpenAI error",
+          checked_at: new Date().toISOString(),
+          latency_ms: Date.now() - startedAt,
+          rate_limits: rateLimits[session.name] || {},
+        });
+        ws.close();
+        return;
+      }
+      if (event.type === "response.completed") {
+        finish({
+          ok: true,
+          status: 200,
+          health_state: "healthy",
+          health_message: "Healthy",
+          checked_at: new Date().toISOString(),
+          latency_ms: Date.now() - startedAt,
+          rate_limits: rateLimits[session.name] || {},
+        });
+        ws.close();
+      }
+    });
+
+    ws.on("error", (err) => {
+      finish({
+        ok: false,
+        status: 502,
+        health_state: "unhealthy",
+        health_message: `Unhealthy: ${err.message}`,
+        reason: err.message,
+        checked_at: new Date().toISOString(),
+        latency_ms: Date.now() - startedAt,
+        rate_limits: rateLimits[session.name] || {},
+      });
+    });
+
+    ws.on("close", (code, reason) => {
+      finish({
+        ok: false,
+        status: code || 502,
+        health_state: "unhealthy",
+        health_message: `Unhealthy: WebSocket closed ${code}`,
+        reason: reason.toString(),
+        checked_at: new Date().toISOString(),
+        latency_ms: Date.now() - startedAt,
+        rate_limits: rateLimits[session.name] || {},
+      });
+    });
+  });
+}
+
+async function runSessionProbe(session: any, deps: Required<ProxyDeps>): Promise<SessionProbeStatus> {
+  const status = session.provider === "openai"
+    ? await runOpenAIProbe(session, deps)
+    : await runAnthropicProbe(session, deps);
+  setProbeStatus(session.name, status);
+  return status;
+}
+
 async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: string, deps: Required<ProxyDeps>): Promise<void> {
   res.setHeader("content-type", "application/json");
 
@@ -374,31 +755,17 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
   if (req.method === "GET" && (path === "/admin/sessions" || path.startsWith("/admin/sessions?"))) {
     const { sessions, active_session } = listSessions();
     const wantHealth = new URL(req.url || "/", "http://127.0.0.1").searchParams.get("health") === "true";
-    const stripTokens = (s: Record<string, any>) =>
-      Object.fromEntries(Object.entries(s).map(([n, v]) => { const { token, ...safe } = v; return [n, safe]; }));
-    let annotatedSessions: Record<string, any> = stripTokens(sessions);
+    let annotatedSessions: Record<string, any> = Object.fromEntries(
+      Object.entries(sessions).map(([name, session]) => [name, getSessionAdminView(name, session)]),
+    );
     if (wantHealth) {
-      const health: Record<string, { ok: boolean; status: number }> = {};
-      await Promise.all(
-        Object.entries(sessions).map(async ([name, session]) => {
-          const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
-          const headers = session.provider === "openai"
-            ? buildCodexHeaders(session.token, (session as any).account_id || "")
-            : buildUpstreamHeaders(session.token, {});
-          try {
-            const upstreamRes = await deps.fetchImpl(`${baseUrl}/v1/models`, { method: "GET", headers });
-            updateRateLimits(name, upstreamRes.headers);
-            health[name] = { ok: upstreamRes.ok, status: upstreamRes.status };
-          } catch {
-            health[name] = { ok: false, status: 0 };
-          }
-        }),
+      const health = Object.fromEntries(
+        await Promise.all(
+          Object.entries(sessions).map(async ([name, session]) => [name, await runSessionProbe({ name, ...session }, deps)] as const),
+        ),
       );
       annotatedSessions = Object.fromEntries(
-        Object.entries(sessions).map(([name, session]) => {
-          const { token, ...safe } = session;
-          return [name, { ...safe, ...health[name] }];
-        }),
+        Object.entries(sessions).map(([name, session]) => [name, { ...getSessionAdminView(name, session), ...health[name] }]),
       );
     }
     res.end(JSON.stringify({ sessions: annotatedSessions, active_session }));
@@ -451,16 +818,18 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
         override_header: "x-llm-session",
         override_ws_param: "?session=<name>",
         rate_limits: {},
+        observability: null,
       }));
       return;
     }
-    const { token, ...safe } = session;
+    const safe = sanitizeSession(session);
     res.end(JSON.stringify({
       active_session: safe,
       available_sessions: availableSessions,
       override_header: "x-llm-session",
       override_ws_param: "?session=<name>",
       rate_limits: rateLimits[session.name] || {},
+      observability: getSessionObservability(session),
     }));
     return;
   }
@@ -505,23 +874,13 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
   // Pings each session with GET /v1/models (no tokens consumed) to refresh rate-limit headers.
   if (req.method === "GET" && path === "/admin/rate-limits") {
     const { sessions } = listSessions();
-    const result: Record<string, { ok: boolean; status: number; rate_limits: Record<string, string> }> = {};
-
-    await Promise.all(
-      Object.entries(sessions).map(async ([name, session]) => {
-        const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
-        const url = `${baseUrl}/v1/models`;
-        const headers = session.provider === "openai"
-          ? buildCodexHeaders(session.token, (session as any).account_id || "")
-          : buildUpstreamHeaders(session.token, {});
-        try {
-          const upstreamRes = await deps.fetchImpl(url, { method: "GET", headers });
-          updateRateLimits(name, upstreamRes.headers);
-          result[name] = { ok: upstreamRes.ok, status: upstreamRes.status, rate_limits: rateLimits[name] || {} };
-        } catch {
-          result[name] = { ok: false, status: 0, rate_limits: rateLimits[name] || {} };
-        }
-      }),
+    const result = Object.fromEntries(
+      await Promise.all(
+        Object.entries(sessions).map(async ([name, session]) => {
+          const probe = await runSessionProbe({ name, ...session }, deps);
+          return [name, probe] as const;
+        }),
+      ),
     );
 
     res.end(JSON.stringify({ rate_limits: result }));

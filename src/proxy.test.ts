@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
-import { createProxyServer } from "./proxy.js";
+import { createProxyServer, resetRuntimeObservability } from "./proxy.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "..", "config.json");
@@ -16,6 +16,7 @@ let originalConfig: string | null = null;
 beforeEach(() => {
   originalConfig = existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf-8") : null;
   rmSync(CONFIG_PATH, { force: true });
+  resetRuntimeObservability();
 });
 
 afterEach(() => {
@@ -742,6 +743,172 @@ describe("proxy HTTP routes", () => {
     });
   });
 
+  it("tracks observability for anthropic requests in /admin/status", async () => {
+    const proxy = createProxyServer({
+      fetchImpl: async () => {
+        return new Response(
+          JSON.stringify({
+            id: "msg_1",
+            type: "message",
+            role: "assistant",
+            model: "claude-haiku-4-5-20251001",
+            content: [],
+            usage: { input_tokens: 11, output_tokens: 7 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "claude-work",
+          provider: "anthropic",
+          token: "sk-ant-test",
+        }),
+      });
+
+      await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+
+      const statusRes = await request(baseUrl, "/admin/status");
+      const statusBody = JSON.parse(statusRes.text);
+      assert.equal(statusBody.observability.last_requested_model, "claude-haiku-4-5-20251001");
+      assert.equal(statusBody.observability.last_effective_model, "claude-haiku-4-5-20251001");
+      assert.deepEqual(statusBody.observability.last_usage, { input_tokens: 11, output_tokens: 7 });
+      assert.deepEqual(statusBody.observability.totals, {
+        input_tokens: 11,
+        output_tokens: 7,
+        requests: 1,
+        errors: 0,
+      });
+    });
+  });
+
+  it("tracks observability for openai requests in /admin/status", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await new Promise<void>((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+    const upstreamAddress = upstreamServer.address();
+    assert.ok(upstreamAddress && typeof upstreamAddress === "object");
+    const upstreamUrl = `ws://127.0.0.1:${upstreamAddress.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_obs",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
+            usage: { input_tokens: 5, output_tokens: 3 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "gpt-work",
+            provider: "openai",
+            token: "sk-openai-test",
+            model_override: "gpt-5.4",
+          }),
+        });
+
+        await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            stream: false,
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        });
+
+        const statusRes = await request(baseUrl, "/admin/status");
+        const statusBody = JSON.parse(statusRes.text);
+        assert.equal(statusBody.observability.configured_model, "gpt-5.4");
+        assert.equal(statusBody.observability.last_requested_model, "claude-haiku-4-5-20251001");
+        assert.equal(statusBody.observability.last_effective_model, "gpt-5.4");
+        assert.deepEqual(statusBody.observability.last_usage, { input_tokens: 5, output_tokens: 3 });
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it("tracks observability errors for failed openai websocket requests", async () => {
+    class FakeErrorSocket extends EventEmitter {
+      send(_data: string): void {}
+      close(): void {}
+    }
+
+    const proxy = createProxyServer({
+      openAIWsFactory: () => {
+        const ws = new FakeErrorSocket();
+        queueMicrotask(() => {
+          ws.emit("open");
+          ws.emit("error", new Error("boom"));
+        });
+        return ws as unknown as WebSocket;
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "gpt-work",
+          provider: "openai",
+          token: "sk-openai-test",
+          model_override: "gpt-5.4",
+        }),
+      });
+
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          stream: false,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+
+      assert.equal(res.status, 502);
+      const body = JSON.parse(res.text);
+      assert.equal(body.error.type, "upstream_connection_error");
+      assert.equal(body.error.message, "boom");
+
+      const statusRes = await request(baseUrl, "/admin/status");
+      const statusBody = JSON.parse(statusRes.text);
+      assert.equal(statusBody.observability.last_error.type, "upstream_connection_error");
+      assert.equal(statusBody.observability.last_error.message, "boom");
+      assert.equal(statusBody.observability.totals.errors, 1);
+    });
+  });
+
   it("returns 502 when the openai websocket emits an error", async () => {
     class FakeErrorSocket extends EventEmitter {
       send(_data: string): void {}
@@ -822,6 +989,15 @@ describe("proxy admin routes", () => {
       assert.equal(listed.sessions["gpt-work"].provider, "openai");
       assert.equal(listed.sessions["claude-work"].token, undefined, "token must not be exposed");
       assert.equal(listed.sessions["gpt-work"].token, undefined, "token must not be exposed");
+      assert.equal(listed.sessions["claude-work"].configured_model, null);
+      assert.equal(listed.sessions["gpt-work"].configured_model, "gpt-5.4");
+      assert.equal(listed.sessions["claude-work"].last_effective_model, null);
+      assert.deepEqual(listed.sessions["claude-work"].totals, {
+        input_tokens: 0,
+        output_tokens: 0,
+        requests: 0,
+        errors: 0,
+      });
 
       const statusBefore = await request(baseUrl, "/admin/status");
       assert.equal(statusBefore.status, 200);
@@ -832,6 +1008,8 @@ describe("proxy admin routes", () => {
       assert.deepEqual(beforeBody.available_sessions, ["claude-work", "gpt-work"]);
       assert.equal(beforeBody.override_header, "x-llm-session");
       assert.equal(beforeBody.override_ws_param, "?session=<name>");
+      assert.equal(beforeBody.observability.configured_model, null);
+      assert.equal(beforeBody.observability.last_effective_model, null);
 
       const switchRes = await request(baseUrl, "/admin/switch/gpt-work", {
         method: "POST",
@@ -883,6 +1061,7 @@ describe("proxy admin routes", () => {
       assert.equal(body.override_header, "x-llm-session");
       assert.equal(body.override_ws_param, "?session=<name>");
       assert.deepEqual(body.rate_limits, {});
+      assert.equal(body.observability, null);
     });
   });
 
@@ -921,47 +1100,14 @@ describe("proxy admin routes", () => {
     });
   });
 
-  it("GET /admin/sessions?health=true pings each session and includes ok/status", async () => {
-    const proxy = createProxyServer({
-      fetchImpl: async (url) => {
-        const status = String(url).includes("anthropic") ? 200 : 401;
-        return new Response("{}", { status });
-      },
-    });
-
-    await withCustomServer(proxy, async (baseUrl) => {
-      await request(baseUrl, "/admin/sessions", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: "claude-work", provider: "anthropic", token: "sk-ant-test", base_url: "https://api.anthropic.test" }),
-      });
-      await request(baseUrl, "/admin/sessions", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: "gpt-bad", provider: "openai", token: "sk-expired", model_override: "gpt-5.4", base_url: "https://api.openai.test" }),
-      });
-
-      const res = await request(baseUrl, "/admin/sessions?health=true");
-      assert.equal(res.status, 200);
-      const body = JSON.parse(res.text);
-      assert.equal(body.sessions["claude-work"].ok, true);
-      assert.equal(body.sessions["claude-work"].status, 200);
-      assert.equal(body.sessions["gpt-bad"].ok, false);
-      assert.equal(body.sessions["gpt-bad"].status, 401);
-    });
-  });
-
-  it("GET /admin/rate-limits pings each session and returns ok status + rate-limit headers", async () => {
-    const fetchCalls: Array<{ url: string; method?: string }> = [];
+  it("GET /admin/sessions?health=true runs an Anthropic chat probe", async () => {
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     const proxy = createProxyServer({
       fetchImpl: async (url, init) => {
-        fetchCalls.push({ url: String(url), method: (init as RequestInit)?.method ?? "POST" });
-        return new Response(JSON.stringify({ data: [] }), {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(JSON.stringify({ id: "msg_probe", model: "claude-haiku-4-5-20251001", usage: { input_tokens: 1, output_tokens: 1 } }), {
           status: 200,
-          headers: {
-            "content-type": "application/json",
-            "x-ratelimit-remaining": "999",
-          },
+          headers: { "content-type": "application/json", "x-ratelimit-remaining": "999" },
         });
       },
     });
@@ -970,27 +1116,82 @@ describe("proxy admin routes", () => {
       await request(baseUrl, "/admin/sessions", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          name: "claude-work",
-          provider: "anthropic",
-          token: "sk-ant-test",
-          base_url: "https://api.anthropic.test",
-        }),
+        body: JSON.stringify({ name: "claude-oauth", provider: "anthropic", token: "sk-ant-oat01-test-token", base_url: "https://api.anthropic.test" }),
       });
 
-      const res = await request(baseUrl, "/admin/rate-limits");
+      const before = JSON.parse((await request(baseUrl, "/admin/status")).text);
+      const res = await request(baseUrl, "/admin/sessions?health=true");
       assert.equal(res.status, 200);
-
-      // One ping fired per session
       assert.equal(fetchCalls.length, 1);
-      assert.equal(fetchCalls[0].url, "https://api.anthropic.test/v1/models");
-      assert.equal(fetchCalls[0].method, "GET");
+      assert.equal(fetchCalls[0].url, "https://api.anthropic.test/v1/messages");
+      const probeBody = JSON.parse(String(fetchCalls[0].init?.body));
+      assert.equal(probeBody.max_tokens, 1);
+      assert.equal(probeBody.messages[0].content, "ping");
 
       const body = JSON.parse(res.text);
-      assert.equal(body.rate_limits["claude-work"].ok, true);
-      assert.equal(body.rate_limits["claude-work"].status, 200);
-      assert.equal(body.rate_limits["claude-work"].rate_limits["x-ratelimit-remaining"], "999");
+      assert.equal(body.sessions["claude-oauth"].ok, true);
+      assert.equal(body.sessions["claude-oauth"].status, 200);
+      assert.equal(body.sessions["claude-oauth"].health_state, "healthy");
+      assert.equal(body.sessions["claude-oauth"].health_message, "Healthy");
+      assert.equal(body.sessions["claude-oauth"].rate_limits["x-ratelimit-remaining"], "999");
+
+      const after = JSON.parse((await request(baseUrl, "/admin/status")).text);
+      assert.deepEqual(after.observability.totals, before.observability.totals, "probe must not affect normal observability totals");
     });
+  });
+
+  it("GET /admin/rate-limits runs an OpenAI chat probe", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await new Promise<void>((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+    const upstreamAddress = upstreamServer.address();
+    assert.ok(upstreamAddress && typeof upstreamAddress === "object");
+    const upstreamUrl = `ws://127.0.0.1:${upstreamAddress.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: { id: "resp_probe", model: "gpt-5.4", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1 } },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "gpt-work",
+            provider: "openai",
+            token: "sk-openai-test",
+            model_override: "gpt-5.4",
+          }),
+        });
+
+        const before = JSON.parse((await request(baseUrl, "/admin/status")).text);
+        const res = await request(baseUrl, "/admin/rate-limits");
+        assert.equal(res.status, 200);
+
+        const body = JSON.parse(res.text);
+        assert.equal(body.rate_limits["gpt-work"].ok, true);
+        assert.equal(body.rate_limits["gpt-work"].status, 200);
+        assert.equal(body.rate_limits["gpt-work"].health_state, "healthy");
+        assert.equal(body.rate_limits["gpt-work"].health_message, "Healthy");
+
+        const after = JSON.parse((await request(baseUrl, "/admin/status")).text);
+        assert.deepEqual(after.observability.totals, before.observability.totals, "probe must not affect normal observability totals");
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
   });
 
   it("GET /admin/rate-limits marks session not-ok when ping returns 4xx", async () => {
