@@ -14,6 +14,17 @@ It gives you one local endpoint on `localhost:8411` and preserves **context cont
 
 When you switch, the next backend still sees the same conversation, tool results, and file context already held by the client.
 
+## Positioning
+
+`llm-switcher` is a local-first open-source LLM router for personal workflows. It turns multiple subscription-backed AI sessions into one local interface instead of trying to be a hosted API platform or a multi-tenant gateway.
+
+It is designed to:
+
+- unify multiple sessions behind one local endpoint
+- switch across providers, accounts, and models without restarting the workflow
+- support richer multi-session and future multi-lane routing
+- make routing easier to inspect with admin APIs and observability
+
 ## Status
 
 `llm-switcher` is currently an **experimental but working prototype**.
