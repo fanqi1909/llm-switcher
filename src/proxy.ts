@@ -192,6 +192,10 @@ function getSessionAdminView(name: string, session: Record<string, any>): Record
   };
 }
 
+function supportsModelsHealthProbe(session: { provider: string; token: string }): boolean {
+  return !(session.provider === "anthropic" && isOAuthToken(session.token));
+}
+
 // --- Per-chat session binding ---
 // Maps x-claude-code-session-id → llm session name, so each chat window can use a different session.
 const chatSessionMap: Record<string, string> = {};
@@ -573,9 +577,13 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
       Object.entries(sessions).map(([name, session]) => [name, getSessionAdminView(name, session)]),
     );
     if (wantHealth) {
-      const health: Record<string, { ok: boolean; status: number }> = {};
+      const health: Record<string, { ok: boolean | null; status: number | null; reason?: string }> = {};
       await Promise.all(
         Object.entries(sessions).map(async ([name, session]) => {
+          if (!supportsModelsHealthProbe(session)) {
+            health[name] = { ok: null, status: null, reason: "models_probe_unsupported_for_anthropic_oauth" };
+            return;
+          }
           const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
           const headers = session.provider === "openai"
             ? buildCodexHeaders(session.token, (session as any).account_id || "")
@@ -699,10 +707,19 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
   // Pings each session with GET /v1/models (no tokens consumed) to refresh rate-limit headers.
   if (req.method === "GET" && path === "/admin/rate-limits") {
     const { sessions } = listSessions();
-    const result: Record<string, { ok: boolean; status: number; rate_limits: Record<string, string> }> = {};
+    const result: Record<string, { ok: boolean | null; status: number | null; rate_limits: Record<string, string>; reason?: string }> = {};
 
     await Promise.all(
       Object.entries(sessions).map(async ([name, session]) => {
+        if (!supportsModelsHealthProbe(session)) {
+          result[name] = {
+            ok: null,
+            status: null,
+            rate_limits: rateLimits[name] || {},
+            reason: "models_probe_unsupported_for_anthropic_oauth",
+          };
+          return;
+        }
         const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
         const url = `${baseUrl}/v1/models`;
         const headers = session.provider === "openai"

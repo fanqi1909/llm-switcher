@@ -1100,10 +1100,10 @@ describe("proxy admin routes", () => {
     });
   });
 
-  it("GET /admin/sessions?health=true pings each session and includes ok/status", async () => {
+  it("GET /admin/sessions?health=true pings probeable sessions and marks Anthropic OAuth as unsupported", async () => {
     const proxy = createProxyServer({
       fetchImpl: async (url) => {
-        const status = String(url).includes("anthropic") ? 200 : 401;
+        const status = String(url).includes("api.openai") ? 401 : 200;
         return new Response("{}", { status });
       },
     });
@@ -1112,7 +1112,7 @@ describe("proxy admin routes", () => {
       await request(baseUrl, "/admin/sessions", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: "claude-work", provider: "anthropic", token: "sk-ant-test", base_url: "https://api.anthropic.test" }),
+        body: JSON.stringify({ name: "claude-oauth", provider: "anthropic", token: "sk-ant-oat01-test-token", base_url: "https://api.anthropic.test" }),
       });
       await request(baseUrl, "/admin/sessions", {
         method: "POST",
@@ -1123,14 +1123,15 @@ describe("proxy admin routes", () => {
       const res = await request(baseUrl, "/admin/sessions?health=true");
       assert.equal(res.status, 200);
       const body = JSON.parse(res.text);
-      assert.equal(body.sessions["claude-work"].ok, true);
-      assert.equal(body.sessions["claude-work"].status, 200);
+      assert.equal(body.sessions["claude-oauth"].ok, null);
+      assert.equal(body.sessions["claude-oauth"].status, null);
+      assert.equal(body.sessions["claude-oauth"].reason, "models_probe_unsupported_for_anthropic_oauth");
       assert.equal(body.sessions["gpt-bad"].ok, false);
       assert.equal(body.sessions["gpt-bad"].status, 401);
     });
   });
 
-  it("GET /admin/rate-limits pings each session and returns ok status + rate-limit headers", async () => {
+  it("GET /admin/rate-limits pings probeable sessions and skips Anthropic OAuth", async () => {
     const fetchCalls: Array<{ url: string; method?: string }> = [];
     const proxy = createProxyServer({
       fetchImpl: async (url, init) => {
@@ -1150,25 +1151,38 @@ describe("proxy admin routes", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          name: "claude-work",
+          name: "claude-oauth",
           provider: "anthropic",
-          token: "sk-ant-test",
+          token: "sk-ant-oat01-test-token",
           base_url: "https://api.anthropic.test",
+        }),
+      });
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "gpt-work",
+          provider: "openai",
+          token: "sk-openai-test",
+          model_override: "gpt-5.4",
+          base_url: "https://api.openai.test",
         }),
       });
 
       const res = await request(baseUrl, "/admin/rate-limits");
       assert.equal(res.status, 200);
 
-      // One ping fired per session
       assert.equal(fetchCalls.length, 1);
-      assert.equal(fetchCalls[0].url, "https://api.anthropic.test/v1/models");
+      assert.equal(fetchCalls[0].url, "https://api.openai.test/v1/models");
       assert.equal(fetchCalls[0].method, "GET");
 
       const body = JSON.parse(res.text);
-      assert.equal(body.rate_limits["claude-work"].ok, true);
-      assert.equal(body.rate_limits["claude-work"].status, 200);
-      assert.equal(body.rate_limits["claude-work"].rate_limits["x-ratelimit-remaining"], "999");
+      assert.equal(body.rate_limits["claude-oauth"].ok, null);
+      assert.equal(body.rate_limits["claude-oauth"].status, null);
+      assert.equal(body.rate_limits["claude-oauth"].reason, "models_probe_unsupported_for_anthropic_oauth");
+      assert.equal(body.rate_limits["gpt-work"].ok, true);
+      assert.equal(body.rate_limits["gpt-work"].status, 200);
+      assert.equal(body.rate_limits["gpt-work"].rate_limits["x-ratelimit-remaining"], "999");
     });
   });
 
