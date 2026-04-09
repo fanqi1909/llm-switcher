@@ -97,11 +97,24 @@ interface SessionObservability {
   };
 }
 
+interface SessionProbeStatus {
+  ok: boolean | null;
+  status: number | null;
+  reason?: string;
+  health_state: "healthy" | "unhealthy" | "unknown";
+  health_message: string;
+  checked_at: string | null;
+  latency_ms: number | null;
+  rate_limits: Record<string, string>;
+}
+
 const sessionObservability: Record<string, SessionObservability> = {};
+const sessionProbeStatus: Record<string, SessionProbeStatus> = {};
 
 export function resetRuntimeObservability(): void {
   for (const key of Object.keys(rateLimits)) delete rateLimits[key];
   for (const key of Object.keys(sessionObservability)) delete sessionObservability[key];
+  for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
 }
 
 function getSessionObservability(session: { name: string; model_override?: string | null }): SessionObservability {
@@ -125,12 +138,17 @@ function getSessionObservability(session: { name: string; model_override?: strin
   return sessionObservability[session.name];
 }
 
-function updateRateLimits(sessionName: string, headers: Headers): void {
+function extractRateLimits(headers: Headers): Record<string, string> {
   const info: Record<string, string> = {};
   for (const key of ["x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"]) {
     const val = headers.get(key);
     if (val) info[key] = val;
   }
+  return info;
+}
+
+function updateRateLimits(sessionName: string, headers: Headers): void {
+  const info = extractRateLimits(headers);
   if (Object.keys(info).length > 0) rateLimits[sessionName] = info;
 }
 
@@ -192,8 +210,20 @@ function getSessionAdminView(name: string, session: Record<string, any>): Record
   };
 }
 
-function supportsModelsHealthProbe(session: { provider: string; token: string }): boolean {
-  return !(session.provider === "anthropic" && isOAuthToken(session.token));
+function getProbeStatus(sessionName: string): SessionProbeStatus {
+  return sessionProbeStatus[sessionName] || {
+    ok: null,
+    status: null,
+    health_state: "unknown",
+    health_message: "Health not checked yet",
+    checked_at: null,
+    latency_ms: null,
+    rate_limits: rateLimits[sessionName] || {},
+  };
+}
+
+function setProbeStatus(sessionName: string, status: SessionProbeStatus): void {
+  sessionProbeStatus[sessionName] = status;
 }
 
 // --- Per-chat session binding ---
@@ -566,6 +596,158 @@ async function handleModels(
   }
 }
 
+async function runAnthropicProbe(session: any, deps: Required<ProxyDeps>): Promise<SessionProbeStatus> {
+  const startedAt = Date.now();
+  const token = session.token;
+  const baseUrl = session.base_url || "https://api.anthropic.com";
+  const headers = buildUpstreamHeaders(token, {});
+  const body = injectBillingHeader({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 1,
+    messages: [{ role: "user", content: "ping" }],
+  }, token);
+
+  try {
+    const upstreamRes = await deps.fetchImpl(getUpstreamUrl(baseUrl), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    const probeRateLimits = extractRateLimits(upstreamRes.headers);
+    if (Object.keys(probeRateLimits).length > 0) rateLimits[session.name] = probeRateLimits;
+    return {
+      ok: upstreamRes.ok,
+      status: upstreamRes.status,
+      health_state: upstreamRes.ok ? "healthy" : "unhealthy",
+      health_message: upstreamRes.ok ? "Healthy" : `Unhealthy: HTTP ${upstreamRes.status}`,
+      checked_at: new Date().toISOString(),
+      latency_ms: Date.now() - startedAt,
+      rate_limits: probeRateLimits,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: 0,
+      health_state: "unhealthy",
+      health_message: "Unhealthy: probe failed",
+      reason: err.message,
+      checked_at: new Date().toISOString(),
+      latency_ms: Date.now() - startedAt,
+      rate_limits: rateLimits[session.name] || {},
+    };
+  }
+}
+
+async function runOpenAIProbe(session: any, deps: Required<ProxyDeps>): Promise<SessionProbeStatus> {
+  const startedAt = Date.now();
+  let translated: { url: string; headers: Record<string, string>; body: string };
+  try {
+    translated = translateRequest({
+      model: "claude-haiku-4-5-20251001",
+      stream: false,
+      messages: [{ role: "user", content: "ping" }],
+    }, session);
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: 422,
+      health_state: "unhealthy",
+      health_message: `Unhealthy: ${err.message}`,
+      reason: err.message,
+      checked_at: new Date().toISOString(),
+      latency_ms: Date.now() - startedAt,
+      rate_limits: rateLimits[session.name] || {},
+    };
+  }
+
+  const requestBody = JSON.parse(translated.body);
+  requestBody.stream = true;
+
+  return await new Promise((resolve) => {
+    const ws = deps.openAIWsFactory(translated.url, { headers: translated.headers });
+    let done = false;
+    const finish = (status: SessionProbeStatus) => {
+      if (done) return;
+      done = true;
+      setProbeStatus(session.name, status);
+      resolve(status);
+    };
+
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ type: "response.create", ...requestBody }));
+    });
+
+    ws.on("message", (data) => {
+      let event: any;
+      try {
+        event = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+      if (event.type === "error") {
+        finish({
+          ok: false,
+          status: 502,
+          health_state: "unhealthy",
+          health_message: `Unhealthy: ${event.error?.message || "OpenAI error"}`,
+          reason: event.error?.message || "OpenAI error",
+          checked_at: new Date().toISOString(),
+          latency_ms: Date.now() - startedAt,
+          rate_limits: rateLimits[session.name] || {},
+        });
+        ws.close();
+        return;
+      }
+      if (event.type === "response.completed") {
+        finish({
+          ok: true,
+          status: 200,
+          health_state: "healthy",
+          health_message: "Healthy",
+          checked_at: new Date().toISOString(),
+          latency_ms: Date.now() - startedAt,
+          rate_limits: rateLimits[session.name] || {},
+        });
+        ws.close();
+      }
+    });
+
+    ws.on("error", (err) => {
+      finish({
+        ok: false,
+        status: 502,
+        health_state: "unhealthy",
+        health_message: `Unhealthy: ${err.message}`,
+        reason: err.message,
+        checked_at: new Date().toISOString(),
+        latency_ms: Date.now() - startedAt,
+        rate_limits: rateLimits[session.name] || {},
+      });
+    });
+
+    ws.on("close", (code, reason) => {
+      finish({
+        ok: false,
+        status: code || 502,
+        health_state: "unhealthy",
+        health_message: `Unhealthy: WebSocket closed ${code}`,
+        reason: reason.toString(),
+        checked_at: new Date().toISOString(),
+        latency_ms: Date.now() - startedAt,
+        rate_limits: rateLimits[session.name] || {},
+      });
+    });
+  });
+}
+
+async function runSessionProbe(session: any, deps: Required<ProxyDeps>): Promise<SessionProbeStatus> {
+  const status = session.provider === "openai"
+    ? await runOpenAIProbe(session, deps)
+    : await runAnthropicProbe(session, deps);
+  setProbeStatus(session.name, status);
+  return status;
+}
+
 async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: string, deps: Required<ProxyDeps>): Promise<void> {
   res.setHeader("content-type", "application/json");
 
@@ -577,47 +759,10 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
       Object.entries(sessions).map(([name, session]) => [name, getSessionAdminView(name, session)]),
     );
     if (wantHealth) {
-      const health: Record<string, {
-        ok: boolean | null;
-        status: number | null;
-        reason?: string;
-        health_state: "healthy" | "unhealthy" | "unknown";
-        health_message: string;
-      }> = {};
-      await Promise.all(
-        Object.entries(sessions).map(async ([name, session]) => {
-          if (!supportsModelsHealthProbe(session)) {
-            health[name] = {
-              ok: null,
-              status: null,
-              reason: "models_probe_unsupported_for_anthropic_oauth",
-              health_state: "unknown",
-              health_message: "Health unknown: models probe unsupported for Anthropic OAuth",
-            };
-            return;
-          }
-          const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
-          const headers = session.provider === "openai"
-            ? buildCodexHeaders(session.token, (session as any).account_id || "")
-            : buildUpstreamHeaders(session.token, {});
-          try {
-            const upstreamRes = await deps.fetchImpl(`${baseUrl}/v1/models`, { method: "GET", headers });
-            updateRateLimits(name, upstreamRes.headers);
-            health[name] = {
-              ok: upstreamRes.ok,
-              status: upstreamRes.status,
-              health_state: upstreamRes.ok ? "healthy" : "unhealthy",
-              health_message: upstreamRes.ok ? "Healthy" : `Unhealthy: HTTP ${upstreamRes.status}`,
-            };
-          } catch {
-            health[name] = {
-              ok: false,
-              status: 0,
-              health_state: "unhealthy",
-              health_message: "Unhealthy: probe failed",
-            };
-          }
-        }),
+      const health = Object.fromEntries(
+        await Promise.all(
+          Object.entries(sessions).map(async ([name, session]) => [name, await runSessionProbe({ name, ...session }, deps)] as const),
+        ),
       );
       annotatedSessions = Object.fromEntries(
         Object.entries(sessions).map(([name, session]) => [name, { ...getSessionAdminView(name, session), ...health[name] }]),
@@ -729,53 +874,13 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
   // Pings each session with GET /v1/models (no tokens consumed) to refresh rate-limit headers.
   if (req.method === "GET" && path === "/admin/rate-limits") {
     const { sessions } = listSessions();
-    const result: Record<string, {
-      ok: boolean | null;
-      status: number | null;
-      rate_limits: Record<string, string>;
-      reason?: string;
-      health_state: "healthy" | "unhealthy" | "unknown";
-      health_message: string;
-    }> = {};
-
-    await Promise.all(
-      Object.entries(sessions).map(async ([name, session]) => {
-        if (!supportsModelsHealthProbe(session)) {
-          result[name] = {
-            ok: null,
-            status: null,
-            rate_limits: rateLimits[name] || {},
-            reason: "models_probe_unsupported_for_anthropic_oauth",
-            health_state: "unknown",
-            health_message: "Health unknown: models probe unsupported for Anthropic OAuth",
-          };
-          return;
-        }
-        const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
-        const url = `${baseUrl}/v1/models`;
-        const headers = session.provider === "openai"
-          ? buildCodexHeaders(session.token, (session as any).account_id || "")
-          : buildUpstreamHeaders(session.token, {});
-        try {
-          const upstreamRes = await deps.fetchImpl(url, { method: "GET", headers });
-          updateRateLimits(name, upstreamRes.headers);
-          result[name] = {
-            ok: upstreamRes.ok,
-            status: upstreamRes.status,
-            rate_limits: rateLimits[name] || {},
-            health_state: upstreamRes.ok ? "healthy" : "unhealthy",
-            health_message: upstreamRes.ok ? "Healthy" : `Unhealthy: HTTP ${upstreamRes.status}`,
-          };
-        } catch {
-          result[name] = {
-            ok: false,
-            status: 0,
-            rate_limits: rateLimits[name] || {},
-            health_state: "unhealthy",
-            health_message: "Unhealthy: probe failed",
-          };
-        }
-      }),
+    const result = Object.fromEntries(
+      await Promise.all(
+        Object.entries(sessions).map(async ([name, session]) => {
+          const probe = await runSessionProbe({ name, ...session }, deps);
+          return [name, probe] as const;
+        }),
+      ),
     );
 
     res.end(JSON.stringify({ rate_limits: result }));

@@ -1100,11 +1100,15 @@ describe("proxy admin routes", () => {
     });
   });
 
-  it("GET /admin/sessions?health=true pings probeable sessions and marks Anthropic OAuth as unsupported", async () => {
+  it("GET /admin/sessions?health=true runs an Anthropic chat probe", async () => {
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     const proxy = createProxyServer({
-      fetchImpl: async (url) => {
-        const status = String(url).includes("api.openai") ? 401 : 200;
-        return new Response("{}", { status });
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(JSON.stringify({ id: "msg_probe", model: "claude-haiku-4-5-20251001", usage: { input_tokens: 1, output_tokens: 1 } }), {
+          status: 200,
+          headers: { "content-type": "application/json", "x-ratelimit-remaining": "999" },
+        });
       },
     });
 
@@ -1114,84 +1118,80 @@ describe("proxy admin routes", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ name: "claude-oauth", provider: "anthropic", token: "sk-ant-oat01-test-token", base_url: "https://api.anthropic.test" }),
       });
-      await request(baseUrl, "/admin/sessions", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: "gpt-bad", provider: "openai", token: "sk-expired", model_override: "gpt-5.4", base_url: "https://api.openai.test" }),
-      });
 
+      const before = JSON.parse((await request(baseUrl, "/admin/status")).text);
       const res = await request(baseUrl, "/admin/sessions?health=true");
       assert.equal(res.status, 200);
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, "https://api.anthropic.test/v1/messages");
+      const probeBody = JSON.parse(String(fetchCalls[0].init?.body));
+      assert.equal(probeBody.max_tokens, 1);
+      assert.equal(probeBody.messages[0].content, "ping");
+
       const body = JSON.parse(res.text);
-      assert.equal(body.sessions["claude-oauth"].ok, null);
-      assert.equal(body.sessions["claude-oauth"].status, null);
-      assert.equal(body.sessions["claude-oauth"].reason, "models_probe_unsupported_for_anthropic_oauth");
-      assert.equal(body.sessions["claude-oauth"].health_state, "unknown");
-      assert.match(body.sessions["claude-oauth"].health_message, /Health unknown/);
-      assert.equal(body.sessions["gpt-bad"].ok, false);
-      assert.equal(body.sessions["gpt-bad"].status, 401);
-      assert.equal(body.sessions["gpt-bad"].health_state, "unhealthy");
-      assert.equal(body.sessions["gpt-bad"].health_message, "Unhealthy: HTTP 401");
+      assert.equal(body.sessions["claude-oauth"].ok, true);
+      assert.equal(body.sessions["claude-oauth"].status, 200);
+      assert.equal(body.sessions["claude-oauth"].health_state, "healthy");
+      assert.equal(body.sessions["claude-oauth"].health_message, "Healthy");
+      assert.equal(body.sessions["claude-oauth"].rate_limits["x-ratelimit-remaining"], "999");
+
+      const after = JSON.parse((await request(baseUrl, "/admin/status")).text);
+      assert.deepEqual(after.observability.totals, before.observability.totals, "probe must not affect normal observability totals");
     });
   });
 
-  it("GET /admin/rate-limits pings probeable sessions and skips Anthropic OAuth", async () => {
-    const fetchCalls: Array<{ url: string; method?: string }> = [];
+  it("GET /admin/rate-limits runs an OpenAI chat probe", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await new Promise<void>((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+    const upstreamAddress = upstreamServer.address();
+    assert.ok(upstreamAddress && typeof upstreamAddress === "object");
+    const upstreamUrl = `ws://127.0.0.1:${upstreamAddress.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: { id: "resp_probe", model: "gpt-5.4", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1 } },
+        }));
+      });
+    });
+
     const proxy = createProxyServer({
-      fetchImpl: async (url, init) => {
-        fetchCalls.push({ url: String(url), method: (init as RequestInit)?.method ?? "POST" });
-        return new Response(JSON.stringify({ data: [] }), {
-          status: 200,
-          headers: {
-            "content-type": "application/json",
-            "x-ratelimit-remaining": "999",
-          },
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "gpt-work",
+            provider: "openai",
+            token: "sk-openai-test",
+            model_override: "gpt-5.4",
+          }),
         });
-      },
-    });
 
-    await withCustomServer(proxy, async (baseUrl) => {
-      await request(baseUrl, "/admin/sessions", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          name: "claude-oauth",
-          provider: "anthropic",
-          token: "sk-ant-oat01-test-token",
-          base_url: "https://api.anthropic.test",
-        }),
+        const before = JSON.parse((await request(baseUrl, "/admin/status")).text);
+        const res = await request(baseUrl, "/admin/rate-limits");
+        assert.equal(res.status, 200);
+
+        const body = JSON.parse(res.text);
+        assert.equal(body.rate_limits["gpt-work"].ok, true);
+        assert.equal(body.rate_limits["gpt-work"].status, 200);
+        assert.equal(body.rate_limits["gpt-work"].health_state, "healthy");
+        assert.equal(body.rate_limits["gpt-work"].health_message, "Healthy");
+
+        const after = JSON.parse((await request(baseUrl, "/admin/status")).text);
+        assert.deepEqual(after.observability.totals, before.observability.totals, "probe must not affect normal observability totals");
       });
-      await request(baseUrl, "/admin/sessions", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          name: "gpt-work",
-          provider: "openai",
-          token: "sk-openai-test",
-          model_override: "gpt-5.4",
-          base_url: "https://api.openai.test",
-        }),
-      });
-
-      const res = await request(baseUrl, "/admin/rate-limits");
-      assert.equal(res.status, 200);
-
-      assert.equal(fetchCalls.length, 1);
-      assert.equal(fetchCalls[0].url, "https://api.openai.test/v1/models");
-      assert.equal(fetchCalls[0].method, "GET");
-
-      const body = JSON.parse(res.text);
-      assert.equal(body.rate_limits["claude-oauth"].ok, null);
-      assert.equal(body.rate_limits["claude-oauth"].status, null);
-      assert.equal(body.rate_limits["claude-oauth"].reason, "models_probe_unsupported_for_anthropic_oauth");
-      assert.equal(body.rate_limits["claude-oauth"].health_state, "unknown");
-      assert.match(body.rate_limits["claude-oauth"].health_message, /Health unknown/);
-      assert.equal(body.rate_limits["gpt-work"].ok, true);
-      assert.equal(body.rate_limits["gpt-work"].status, 200);
-      assert.equal(body.rate_limits["gpt-work"].health_state, "healthy");
-      assert.equal(body.rate_limits["gpt-work"].health_message, "Healthy");
-      assert.equal(body.rate_limits["gpt-work"].rate_limits["x-ratelimit-remaining"], "999");
-    });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
   });
 
   it("GET /admin/rate-limits marks session not-ok when ping returns 4xx", async () => {
