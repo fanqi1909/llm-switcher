@@ -335,7 +335,7 @@ Two important details:
 - When the active session is **Anthropic**, Claude Code traffic is passed through with minimal changes.
 - When the active session is **OpenAI**, Claude Code still speaks Anthropic to the proxy, and the proxy translates the request/streaming response to the OpenAI side.
 
-For implementation details, protocol mapping, and event flow, see [docs/design.md](docs/design.md). For statusline-specific design notes, see [docs/statusline-design.md](docs/statusline-design.md).
+For implementation details, protocol mapping, and event flow, see [docs/design.md](docs/design.md). For the next internal routing abstraction for root agents and subagents, see [docs/lane-design.md](docs/lane-design.md). For statusline-specific design notes, see [docs/statusline-design.md](docs/statusline-design.md).
 
 ## Current Limitations
 
