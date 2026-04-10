@@ -2,6 +2,8 @@
 
 This document proposes the next session model for `llm-switcher`.
 
+It now serves as the predecessor design for the current global/scoped session-selection layer. The follow-on internal routing model for root agents and subagents is defined in [lane-design.md](lane-design.md).
+
 It is driven by the workflow scenarios in [local-session-scenarios.md](local-session-scenarios.md), especially:
 
 - quota failover without context loss

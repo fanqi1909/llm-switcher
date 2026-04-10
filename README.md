@@ -14,6 +14,17 @@ It gives you one local endpoint on `localhost:8411` and preserves **context cont
 
 When you switch, the next backend still sees the same conversation, tool results, and file context already held by the client.
 
+## Positioning
+
+`llm-switcher` is a local-first open-source LLM router for personal workflows. It turns multiple subscription-backed AI sessions into one local interface instead of trying to be a hosted API platform or a multi-tenant gateway.
+
+It is designed to:
+
+- unify multiple sessions behind one local endpoint
+- switch across providers, accounts, and models without restarting the workflow
+- support richer multi-session and future multi-lane routing
+- make routing easier to inspect with admin APIs and observability
+
 ## Status
 
 `llm-switcher` is currently an **experimental but working prototype**.
@@ -324,7 +335,7 @@ Two important details:
 - When the active session is **Anthropic**, Claude Code traffic is passed through with minimal changes.
 - When the active session is **OpenAI**, Claude Code still speaks Anthropic to the proxy, and the proxy translates the request/streaming response to the OpenAI side.
 
-For implementation details, protocol mapping, and event flow, see [docs/design.md](docs/design.md). For statusline-specific design notes, see [docs/statusline-design.md](docs/statusline-design.md).
+For implementation details, protocol mapping, and event flow, see [docs/design.md](docs/design.md). For the next internal routing abstraction for root agents and subagents, see [docs/lane-design.md](docs/lane-design.md). For statusline-specific design notes, see [docs/statusline-design.md](docs/statusline-design.md).
 
 ## Current Limitations
 

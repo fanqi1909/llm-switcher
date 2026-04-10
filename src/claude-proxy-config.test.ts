@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   applyClaudeProxyConfig,
+  disableClaudeStatusline,
+  enableClaudeStatusline,
   getDefaultClaudeSettingsPath,
+  getProjectClaudeLocalSettingsPath,
   readClaudeSettings,
   writeClaudeSettings,
 } from "./claude-proxy-config.js";
@@ -26,6 +29,13 @@ describe("claude proxy config", () => {
     );
   });
 
+  it("computes the project-local Claude settings path", () => {
+    assert.equal(
+      getProjectClaudeLocalSettingsPath("/tmp/demo-project"),
+      "/tmp/demo-project/.claude/settings.local.json",
+    );
+  });
+
   it("merges the proxy env without dropping existing keys", () => {
     const updated = applyClaudeProxyConfig({
       theme: "light",
@@ -37,6 +47,72 @@ describe("claude proxy config", () => {
     assert.equal(updated.theme, "light");
     assert.equal(updated.env.FOO, "bar");
     assert.equal(updated.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8411");
+  });
+
+  it("enables project-local statusline without dropping other keys", () => {
+    const updated = enableClaudeStatusline({
+      theme: "light",
+      env: {
+        FOO: "bar",
+      },
+    });
+
+    assert.equal(updated.theme, "light");
+    assert.equal(updated.env.FOO, "bar");
+    assert.deepEqual(updated.statusLine, {
+      type: "command",
+      command: "llm-switcher statusline",
+      padding: 2,
+    });
+  });
+
+  it("disables project-local statusline without dropping other keys", () => {
+    const updated = disableClaudeStatusline({
+      theme: "light",
+      statusLine: {
+        type: "command",
+        command: "llm-switcher statusline",
+        padding: 2,
+      },
+    });
+
+    assert.equal(updated.theme, "light");
+    assert.equal("statusLine" in updated, false);
+  });
+
+  it("writes merged project-local settings JSON", () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-switcher-claude-settings-"));
+    tempDirs.push(dir);
+    const settingsPath = getProjectClaudeLocalSettingsPath(dir);
+
+    writeClaudeSettings(settingsPath, enableClaudeStatusline({ theme: "dark" }));
+
+    assert.equal(
+      readFileSync(settingsPath, "utf-8"),
+      '{\n  "theme": "dark",\n  "statusLine": {\n    "type": "command",\n    "command": "llm-switcher statusline",\n    "padding": 2\n  }\n}\n',
+    );
+  });
+
+  it("writes settings after removing only statusLine", () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-switcher-claude-settings-"));
+    tempDirs.push(dir);
+    const settingsPath = getProjectClaudeLocalSettingsPath(dir);
+
+    writeClaudeSettings(
+      settingsPath,
+      disableClaudeStatusline({
+        theme: "dark",
+        statusLine: {
+          type: "command",
+          command: "llm-switcher statusline",
+          padding: 2,
+        },
+      }),
+    );
+
+    assert.deepEqual(readClaudeSettings(settingsPath), {
+      theme: "dark",
+    });
   });
 
   it("writes and reads Claude settings JSON", () => {

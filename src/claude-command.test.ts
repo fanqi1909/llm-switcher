@@ -29,6 +29,8 @@ describe("claude command installer", () => {
     const markdown = getClaudeCommandMarkdown(join(process.cwd()));
     assert.match(markdown, /llm-switcher proxy/);
     assert.match(markdown, /admin\/chat-bind/);
+    assert.match(markdown, /statusline on/);
+    assert.match(markdown, /settings\.local\.json/);
   });
 
   it("installs llm-switch.md into the target commands directory", () => {
