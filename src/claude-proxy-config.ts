@@ -3,9 +3,15 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 const DEFAULT_PROXY_URL = "http://127.0.0.1:8411";
+const STATUSLINE_COMMAND = "llm-switcher statusline";
+const STATUSLINE_PADDING = 2;
 
 export function getDefaultClaudeSettingsPath(home: string = homedir()): string {
   return join(home, ".claude", "settings.json");
+}
+
+export function getProjectClaudeLocalSettingsPath(projectRoot: string): string {
+  return join(projectRoot, ".claude", "settings.local.json");
 }
 
 export function readClaudeSettings(path: string): Record<string, any> {
@@ -27,6 +33,23 @@ export function applyClaudeProxyConfig(settings: Record<string, any>, proxyUrl: 
 export function writeClaudeSettings(path: string, settings: Record<string, any>): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
+}
+
+export function enableClaudeStatusline(settings: Record<string, any>): Record<string, any> {
+  return {
+    ...settings,
+    statusLine: {
+      type: "command",
+      command: STATUSLINE_COMMAND,
+      padding: STATUSLINE_PADDING,
+    },
+  };
+}
+
+export function disableClaudeStatusline(settings: Record<string, any>): Record<string, any> {
+  const next = { ...settings };
+  delete next.statusLine;
+  return next;
 }
 
 export async function assertLocalProxyHealthy(proxyUrl: string = DEFAULT_PROXY_URL): Promise<void> {
