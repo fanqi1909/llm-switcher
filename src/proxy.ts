@@ -139,11 +139,13 @@ interface SessionProbeStatus {
 
 const sessionObservability: Record<string, SessionObservability> = {};
 const sessionProbeStatus: Record<string, SessionProbeStatus> = {};
+const pendingTokenRefresh = new Map<string, Promise<import("./codex.js").CodexTokenRefreshResult>>();
 
 export function resetRuntimeObservability(): void {
   for (const key of Object.keys(rateLimits)) delete rateLimits[key];
   for (const key of Object.keys(sessionObservability)) delete sessionObservability[key];
   for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
+  pendingTokenRefresh.clear();
 }
 
 export function setProbeCheckedAtForTest(sessionName: string, checkedAt: string): void {
@@ -681,12 +683,22 @@ async function handleOpenAIProxy(
     });
 
     ws.on("error", async (err) => {
-      if (canRetry && err.message.includes("401")) {
+      const is401 = (err as any).statusCode === 401 || err.message.includes("401");
+      if (canRetry && is401) {
         const refreshToken = session.refresh_token;
         if (refreshToken) {
           console.error(`[OpenAI] Token expired, attempting refresh for session '${session.name}'`);
           try {
-            const result = await refreshCodexToken(refreshToken, deps.fetchImpl);
+            // Deduplicate concurrent refreshes: if another request already started a refresh
+            // for this session, wait for that result rather than burning the rotation token twice.
+            let refreshPromise = pendingTokenRefresh.get(session.name);
+            if (!refreshPromise) {
+              refreshPromise = refreshCodexToken(refreshToken, deps.fetchImpl).finally(() => {
+                pendingTokenRefresh.delete(session.name);
+              });
+              pendingTokenRefresh.set(session.name, refreshPromise);
+            }
+            const result = await refreshPromise;
             updateSessionToken(session.name, result.access_token);
             updateCodexAuthFile(result);
             session.token = result.access_token;
@@ -696,6 +708,10 @@ async function handleOpenAIProxy(
             return;
           } catch (refreshErr) {
             console.error(`[OpenAI] Token refresh failed:`, (refreshErr as Error).message);
+            endResponse(502, {
+              error: { type: "token_refresh_failed", message: (refreshErr as Error).message },
+            });
+            return;
           }
         }
       }
@@ -707,7 +723,7 @@ async function handleOpenAIProxy(
         type: "upstream_connection_error",
         message: err.message,
       });
-      endResponse(err.message.includes("401") ? 401 : 502, {
+      endResponse(502, {
         error: { type: "upstream_connection_error", message: err.message },
       });
     });
