@@ -11,6 +11,7 @@ export interface Session {
   base_url: string;
   model_override?: string;
   account_id?: string;
+  refresh_token?: string;
 }
 
 export interface Config {
@@ -39,6 +40,7 @@ export function addSession(
   baseUrl?: string,
   modelOverride?: string,
   accountId?: string,
+  refreshToken?: string,
 ): void {
   const config = loadConfig();
   config.sessions[name] = {
@@ -47,8 +49,16 @@ export function addSession(
     base_url: baseUrl ?? (provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com"),
     ...(modelOverride ? { model_override: modelOverride } : {}),
     ...(accountId ? { account_id: accountId } : {}),
+    ...(refreshToken ? { refresh_token: refreshToken } : {}),
   };
   if (!config.active_session) config.active_session = name;
+  saveConfig(config);
+}
+
+export function updateSessionToken(name: string, token: string): void {
+  const config = loadConfig();
+  if (!config.sessions[name]) throw new Error(`Session '${name}' not found`);
+  config.sessions[name].token = token;
   saveConfig(config);
 }
 
