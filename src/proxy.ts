@@ -1,8 +1,8 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
-import { getActiveSession, listSessions, addSession, removeSession, setActive } from "./config.js";
+import { getActiveSession, listSessions, addSession, removeSession, setActive, updateSessionToken } from "./config.js";
 import type { Session } from "./config.js";
-import { buildCodexHeaders } from "./codex.js";
+import { buildCodexHeaders, refreshCodexToken, updateCodexAuthFile } from "./codex.js";
 import { inferProviderFromModel, pickDeterministicSessionName } from "./models.js";
 import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
 
@@ -580,7 +580,7 @@ async function handleProxy(
 async function handleOpenAIProxy(
   res: ServerResponse,
   requestBody: any,
-  session: { name: string; token: string; model_override?: string; account_id?: string },
+  session: { name: string; token: string; model_override?: string; account_id?: string; refresh_token?: string },
   deps: Required<ProxyDeps>,
   responseHeaders: Record<string, string> = sessionUsedHeader(session.name),
   routingData: { resolvedSession?: string | null; inferredProvider?: Session["provider"] | null; resolutionReason?: RoutingReason | null } = {},
@@ -595,9 +595,7 @@ async function handleOpenAIProxy(
   }
 
   const isStream = requestBody.stream === true;
-  const ws = deps.openAIWsFactory(translated.url, { headers: translated.headers });
   let responseDone = false;
-  const processWsEvent = createWsEventProcessor();
   const requestedModel = typeof requestBody.model === "string" ? requestBody.model : null;
   const effectiveModel = typeof requestBody.model === "string" ? requestBody.model : session.model_override || null;
 
@@ -624,83 +622,111 @@ async function handleOpenAIProxy(
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   }
 
-  ws.on("open", () => {
-    ws.send(JSON.stringify({ type: "response.create", ...requestBody }));
-  });
+  function connectWs(token: string, canRetry: boolean): void {
+    const headers = buildCodexHeaders(token, session.account_id || "");
+    const ws = deps.openAIWsFactory(translated.url, { headers });
+    const processWsEvent = createWsEventProcessor();
 
-  ws.on("message", (data) => {
-    let event: any;
-    try {
-      event = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ type: "response.create", ...requestBody }));
+    });
 
-    if (event.type === "error") {
-      console.error(`[OpenAI] WS error event:`, JSON.stringify(event));
-      recordSessionError(session, {
-        requestedModel,
-        effectiveModel,
-        ...routingData,
-        type: event.error?.type || "api_error",
-        message: event.error?.message || "OpenAI error",
-      });
-      endResponse(502, { error: { type: "api_error", message: event.error?.message || "OpenAI error" } });
-      ws.close();
-      return;
-    }
+    ws.on("message", (data) => {
+      let event: any;
+      try {
+        event = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
 
-    if (isStream) {
-      processWsEvent(event, writeSSE);
-      if (event.type === "response.completed") {
+      if (event.type === "error") {
+        console.error(`[OpenAI] WS error event:`, JSON.stringify(event));
+        recordSessionError(session, {
+          requestedModel,
+          effectiveModel,
+          ...routingData,
+          type: event.error?.type || "api_error",
+          message: event.error?.message || "OpenAI error",
+        });
+        endResponse(502, { error: { type: "api_error", message: event.error?.message || "OpenAI error" } });
+        ws.close();
+        return;
+      }
+
+      if (isStream) {
+        processWsEvent(event, writeSSE);
+        if (event.type === "response.completed") {
+          recordSessionSuccess(session, {
+            requestedModel,
+            effectiveModel,
+            ...routingData,
+            usage: event.response?.usage || null,
+          });
+          processWsEvent({ type: "_finish" }, writeSSE);
+          responseDone = true;
+          res.end();
+          ws.close();
+        }
+      } else if (event.type === "response.completed") {
         recordSessionSuccess(session, {
           requestedModel,
           effectiveModel,
           ...routingData,
           usage: event.response?.usage || null,
         });
-        processWsEvent({ type: "_finish" }, writeSSE);
-        responseDone = true;
-        res.end();
+        const anthropicRes = translateResponse(event.response);
+        endResponse(200, anthropicRes);
         ws.close();
       }
-    } else if (event.type === "response.completed") {
-      recordSessionSuccess(session, {
-        requestedModel,
-        effectiveModel,
-        ...routingData,
-        usage: event.response?.usage || null,
-      });
-      const anthropicRes = translateResponse(event.response);
-      endResponse(200, anthropicRes);
-      ws.close();
-    }
-  });
-
-  ws.on("error", (err) => {
-    console.error(`[OpenAI] WS connection error:`, err.message);
-    recordSessionError(session, {
-      requestedModel,
-      effectiveModel,
-      ...routingData,
-      type: "upstream_connection_error",
-      message: err.message,
     });
-    endResponse(502, { error: { type: "upstream_connection_error", message: err.message } });
-  });
 
-  ws.on("close", (code) => {
-    if (!responseDone && code !== 1000) {
+    ws.on("error", async (err) => {
+      if (canRetry && err.message.includes("401")) {
+        const refreshToken = session.refresh_token;
+        if (refreshToken) {
+          console.error(`[OpenAI] Token expired, attempting refresh for session '${session.name}'`);
+          try {
+            const result = await refreshCodexToken(refreshToken, deps.fetchImpl);
+            updateSessionToken(session.name, result.access_token);
+            updateCodexAuthFile(result);
+            session.token = result.access_token;
+            if (result.refresh_token) session.refresh_token = result.refresh_token;
+            console.error(`[OpenAI] Token refreshed, retrying`);
+            connectWs(result.access_token, false);
+            return;
+          } catch (refreshErr) {
+            console.error(`[OpenAI] Token refresh failed:`, (refreshErr as Error).message);
+          }
+        }
+      }
+      console.error(`[OpenAI] WS connection error:`, err.message);
       recordSessionError(session, {
         requestedModel,
         effectiveModel,
         ...routingData,
-        type: "upstream_closed",
-        message: `Upstream WebSocket closed unexpectedly (${code})`,
+        type: "upstream_connection_error",
+        message: err.message,
       });
-      endResponse(502, { error: { type: "upstream_closed", message: `Upstream WebSocket closed unexpectedly (${code})` } });
-    }
-  });
+      endResponse(err.message.includes("401") ? 401 : 502, {
+        error: { type: "upstream_connection_error", message: err.message },
+      });
+    });
+
+    ws.on("close", (code) => {
+      if (!responseDone && code !== 1000) {
+        recordSessionError(session, {
+          requestedModel,
+          effectiveModel,
+          ...routingData,
+          type: "upstream_closed",
+          message: `Upstream WebSocket closed unexpectedly (${code})`,
+        });
+        endResponse(502, { error: { type: "upstream_closed", message: `Upstream WebSocket closed unexpectedly (${code})` } });
+      }
+    });
+  }
+
+  connectWs(session.token, true);
 }
 
 async function handleModels(
@@ -962,7 +988,7 @@ async function handleAdmin(
       res.end(JSON.stringify({ error: { type: "invalid_request", message: "name, provider, and token are required" } }));
       return;
     }
-    addSession(body.name, body.provider, body.token, body.base_url, body.model_override, body.account_id);
+    addSession(body.name, body.provider, body.token, body.base_url, body.model_override, body.account_id, body.refresh_token);
     res.writeHead(201, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     return;
