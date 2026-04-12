@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "./config.js";
-import { createProxyServer, resetRuntimeObservability } from "./proxy.js";
+import { createProxyServer, resetRuntimeObservability, setProbeCheckedAtForTest } from "./proxy.js";
 
 const tempDirs: string[] = [];
 
@@ -498,5 +498,113 @@ describe("proxy HTTP routes", () => {
       assert.equal(res.headers.get("x-llm-session-used"), "opus-pinned");
       assert.equal(res.headers.get("x-llm-routing-reason"), "model_override_exact");
     });
+  });
+});
+
+describe("session probe TTL", () => {
+  it("caches probe result within 60s and does not re-probe", async () => {
+    let probeCalls = 0;
+    const proxy = createProxyServer({
+      fetchImpl: async (url) => {
+        if (String(url).includes("/v1/messages")) probeCalls++;
+        return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "probe-session", provider: "anthropic", token: "sk-ant-test" }),
+      });
+
+      await request(baseUrl, "/admin/rate-limits");
+      await request(baseUrl, "/admin/rate-limits");
+
+      assert.equal(probeCalls, 1, "second call within TTL should use cache");
+    });
+  });
+
+  it("re-probes after TTL expires", async () => {
+    let probeCalls = 0;
+    const proxy = createProxyServer({
+      fetchImpl: async (url) => {
+        if (String(url).includes("/v1/messages")) probeCalls++;
+        return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "probe-session", provider: "anthropic", token: "sk-ant-test" }),
+      });
+
+      await request(baseUrl, "/admin/rate-limits");
+      assert.equal(probeCalls, 1);
+
+      // Backdate the cached probe to simulate TTL expiry
+      const staleTime = new Date(Date.now() - 61_000).toISOString();
+      setProbeCheckedAtForTest("probe-session", staleTime);
+
+      await request(baseUrl, "/admin/rate-limits");
+      assert.equal(probeCalls, 2, "should re-probe after TTL expires");
+    });
+  });
+});
+
+describe("OpenAI proxy effectiveModel", () => {
+  it("records last_effective_model in observability after a successful OpenAI request", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await once(upstreamServer.listen(0, "127.0.0.1"), "listening");
+    const addr = upstreamServer.address();
+    assert.ok(addr && typeof addr === "object");
+    const upstreamUrl = `ws://127.0.0.1:${addr.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_eff",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [{ type: "message", content: [{ type: "output_text", text: "hi" }] }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "gpt-work", provider: "openai", token: "sk-openai-test", model_override: "gpt-5.4" }),
+        });
+
+        const res = await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-llm-session": "gpt-work" },
+          body: JSON.stringify({ stream: false, model: "gpt-5.4", messages: [{ role: "user", content: "hi" }] }),
+        });
+        assert.equal(res.status, 200);
+
+        const sessionsRes = await request(baseUrl, "/admin/sessions");
+        const body = JSON.parse(sessionsRes.text);
+        assert.equal(body.sessions["gpt-work"].last_effective_model, "gpt-5.4");
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
   });
 });

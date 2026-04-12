@@ -146,6 +146,12 @@ export function resetRuntimeObservability(): void {
   for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
 }
 
+export function setProbeCheckedAtForTest(sessionName: string, checkedAt: string): void {
+  if (sessionProbeStatus[sessionName]) {
+    sessionProbeStatus[sessionName] = { ...sessionProbeStatus[sessionName], checked_at: checkedAt };
+  }
+}
+
 function getSessionObservability(session: { name: string; model_override?: string | null }): SessionObservability {
   if (!sessionObservability[session.name]) {
     sessionObservability[session.name] = {
