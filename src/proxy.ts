@@ -1,7 +1,9 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { getActiveSession, listSessions, addSession, removeSession, setActive } from "./config.js";
+import type { Session } from "./config.js";
 import { buildCodexHeaders } from "./codex.js";
+import { inferProviderFromModel, pickDeterministicSessionName } from "./models.js";
 import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
 
 type FetchImpl = typeof fetch;
@@ -14,11 +16,37 @@ interface ProxyDeps {
   codexBridgeUrl?: string;
 }
 
-function sessionUsedHeader(sessionName: string): Record<string, string> {
-  return { "x-llm-session-used": sessionName };
+type RoutingReason =
+  | "explicit_session_header"
+  | "explicit_session_header_compat"
+  | "model_override_exact"
+  | "session_name_alias"
+  | "provider_inference_match"
+  | "chat_binding_fallback"
+  | "active_session_fallback";
+
+interface RoutingResolution {
+  requestedSession: string | null;
+  requestedModel: string | null;
+  resolvedSessionName: string | null;
+  inferredProvider: Session["provider"] | null;
+  reason: RoutingReason | null;
 }
 
-// --- OAuth helpers ---
+function sessionUsedHeader(sessionName: string, reason?: RoutingReason | null): Record<string, string> {
+  return {
+    "x-llm-session-used": sessionName,
+    ...(reason ? { "x-llm-routing-reason": reason } : {}),
+  };
+}
+
+function getExplicitSessionReason(req: IncomingMessage): RoutingReason | null {
+  const primary = req.headers["x-llm-session"];
+  if (typeof primary === "string" && primary.trim()) return "explicit_session_header";
+  const compat = req.headers["x-llm-switch-session"];
+  if (typeof compat === "string" && compat.trim()) return "explicit_session_header_compat";
+  return null;
+}
 
 const BILLING_BLOCK = {
   type: "text",
@@ -44,7 +72,6 @@ function buildUpstreamHeaders(token: string, incomingHeaders: Record<string, str
     headers["x-api-key"] = token;
   }
 
-  // Forward relevant headers from incoming request
   const forward = ["anthropic-version", "anthropic-beta", "x-claude-code-session-id", "x-client-request-id"];
   for (const key of forward) {
     if (incomingHeaders[key]) headers[key] = incomingHeaders[key];
@@ -74,7 +101,6 @@ function getUpstreamUrl(baseUrl: string): string {
   return `${baseUrl}/v1/messages`;
 }
 
-// --- Runtime observability tracking ---
 const rateLimits: Record<string, Record<string, string>> = {};
 
 interface SessionUsageSnapshot {
@@ -86,6 +112,9 @@ interface SessionObservability {
   configured_model: string | null;
   last_requested_model: string | null;
   last_effective_model: string | null;
+  last_resolved_session: string | null;
+  last_inferred_provider: Session["provider"] | null;
+  last_resolution_reason: RoutingReason | null;
   last_used_at: string | null;
   last_error: { type: string; message: string; status?: number } | null;
   last_usage: SessionUsageSnapshot | null;
@@ -117,12 +146,21 @@ export function resetRuntimeObservability(): void {
   for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
 }
 
+export function setProbeCheckedAtForTest(sessionName: string, checkedAt: string): void {
+  if (sessionProbeStatus[sessionName]) {
+    sessionProbeStatus[sessionName] = { ...sessionProbeStatus[sessionName], checked_at: checkedAt };
+  }
+}
+
 function getSessionObservability(session: { name: string; model_override?: string | null }): SessionObservability {
   if (!sessionObservability[session.name]) {
     sessionObservability[session.name] = {
       configured_model: session.model_override || null,
       last_requested_model: null,
       last_effective_model: null,
+      last_resolved_session: null,
+      last_inferred_provider: null,
+      last_resolution_reason: null,
       last_used_at: null,
       last_error: null,
       last_usage: null,
@@ -157,12 +195,18 @@ function recordSessionSuccess(
   data: {
     requestedModel?: string | null;
     effectiveModel?: string | null;
+    resolvedSession?: string | null;
+    inferredProvider?: Session["provider"] | null;
+    resolutionReason?: RoutingReason | null;
     usage?: { input_tokens?: number; output_tokens?: number } | null;
   },
 ): void {
   const snapshot = getSessionObservability(session);
   snapshot.last_requested_model = data.requestedModel ?? snapshot.last_requested_model;
   snapshot.last_effective_model = data.effectiveModel ?? snapshot.last_effective_model;
+  snapshot.last_resolved_session = data.resolvedSession ?? snapshot.last_resolved_session;
+  snapshot.last_inferred_provider = data.inferredProvider ?? snapshot.last_inferred_provider;
+  snapshot.last_resolution_reason = data.resolutionReason ?? snapshot.last_resolution_reason;
   snapshot.last_used_at = new Date().toISOString();
   snapshot.last_error = null;
   snapshot.totals.requests += 1;
@@ -181,6 +225,9 @@ function recordSessionError(
   data: {
     requestedModel?: string | null;
     effectiveModel?: string | null;
+    resolvedSession?: string | null;
+    inferredProvider?: Session["provider"] | null;
+    resolutionReason?: RoutingReason | null;
     type: string;
     message: string;
     status?: number;
@@ -189,6 +236,9 @@ function recordSessionError(
   const snapshot = getSessionObservability(session);
   snapshot.last_requested_model = data.requestedModel ?? snapshot.last_requested_model;
   snapshot.last_effective_model = data.effectiveModel ?? snapshot.last_effective_model;
+  snapshot.last_resolved_session = data.resolvedSession ?? snapshot.last_resolved_session;
+  snapshot.last_inferred_provider = data.inferredProvider ?? snapshot.last_inferred_provider;
+  snapshot.last_resolution_reason = data.resolutionReason ?? snapshot.last_resolution_reason;
   snapshot.last_used_at = new Date().toISOString();
   snapshot.last_error = {
     type: data.type,
@@ -226,8 +276,6 @@ function setProbeStatus(sessionName: string, status: SessionProbeStatus): void {
   sessionProbeStatus[sessionName] = status;
 }
 
-// --- Per-chat session binding ---
-// Maps x-claude-code-session-id → llm session name, so each chat window can use a different session.
 const chatSessionMap: Record<string, string> = {};
 let lastSeenChatSessionId: string | null = null;
 
@@ -245,8 +293,10 @@ function getScopedSession(name: string | null | undefined) {
 }
 
 function getRequestedSessionName(req: IncomingMessage): string | null {
-  const header = req.headers["x-llm-session"] ?? req.headers["x-llm-switch-session"];
-  if (typeof header === "string" && header.trim()) return header.trim();
+  const primary = req.headers["x-llm-session"];
+  if (typeof primary === "string" && primary.trim()) return primary.trim();
+  const compat = req.headers["x-llm-switch-session"];
+  if (typeof compat === "string" && compat.trim()) return compat.trim();
   return null;
 }
 
@@ -256,14 +306,121 @@ function getRequestedWsSessionName(req: IncomingMessage): string | null {
   return parsed.searchParams.get("session");
 }
 
-// --- Request body parser ---
+function resolveModelRoutedSession(bodyModel: unknown): Pick<RoutingResolution, "requestedModel" | "resolvedSessionName" | "inferredProvider" | "reason"> {
+  if (typeof bodyModel !== "string" || !bodyModel.trim()) {
+    return {
+      requestedModel: null,
+      resolvedSessionName: null,
+      inferredProvider: null,
+      reason: null,
+    };
+  }
+
+  const requestedModel = bodyModel.trim();
+  const { sessions, active_session } = listSessions();
+
+  const exactModelMatches = Object.entries(sessions)
+    .filter(([, session]) => session.model_override === requestedModel)
+    .map(([name]) => name);
+  const exactModelMatch = pickDeterministicSessionName(exactModelMatches, active_session);
+  if (exactModelMatch) {
+    return {
+      requestedModel,
+      resolvedSessionName: exactModelMatch,
+      inferredProvider: null,
+      reason: "model_override_exact",
+    };
+  }
+
+  if (sessions[requestedModel]) {
+    return {
+      requestedModel,
+      resolvedSessionName: requestedModel,
+      inferredProvider: null,
+      reason: "session_name_alias",
+    };
+  }
+
+  const provider = inferProviderFromModel(requestedModel);
+  if (!provider) {
+    return {
+      requestedModel,
+      resolvedSessionName: null,
+      inferredProvider: null,
+      reason: null,
+    };
+  }
+
+  const providerMatches = Object.entries(sessions)
+    .filter(([, session]) => session.provider === provider)
+    .map(([name]) => name);
+  const resolvedSessionName = pickDeterministicSessionName(providerMatches, active_session);
+  return {
+    requestedModel,
+    resolvedSessionName,
+    inferredProvider: provider,
+    reason: resolvedSessionName ? "provider_inference_match" : null,
+  };
+}
+
+function resolveHttpRouting(req: IncomingMessage, body: any, chatSessionId: string | null): RoutingResolution {
+  const explicitSession = getRequestedSessionName(req);
+  const explicitReason = getExplicitSessionReason(req);
+  if (explicitSession) {
+    return {
+      requestedSession: explicitSession,
+      requestedModel: typeof body.model === "string" ? body.model : null,
+      resolvedSessionName: explicitSession,
+      inferredProvider: null,
+      reason: explicitReason,
+    };
+  }
+
+  const modelResolution = resolveModelRoutedSession(body.model);
+  if (modelResolution.resolvedSessionName) {
+    return {
+      requestedSession: modelResolution.resolvedSessionName,
+      requestedModel: modelResolution.requestedModel,
+      resolvedSessionName: modelResolution.resolvedSessionName,
+      inferredProvider: modelResolution.inferredProvider,
+      reason: modelResolution.reason,
+    };
+  }
+
+  const chatBoundSession = chatSessionId ? chatSessionMap[chatSessionId] : undefined;
+  if (chatBoundSession) {
+    return {
+      requestedSession: chatBoundSession,
+      requestedModel: modelResolution.requestedModel,
+      resolvedSessionName: chatBoundSession,
+      inferredProvider: modelResolution.inferredProvider,
+      reason: "chat_binding_fallback",
+    };
+  }
+
+  const active = getActiveSession();
+  return {
+    requestedSession: active?.name || null,
+    requestedModel: modelResolution.requestedModel,
+    resolvedSessionName: active?.name || null,
+    inferredProvider: modelResolution.inferredProvider,
+    reason: active ? "active_session_fallback" : null,
+  };
+}
+
+function getRoutingReasonData(resolution: RoutingResolution) {
+  return {
+    resolvedSession: resolution.resolvedSessionName,
+    inferredProvider: resolution.inferredProvider,
+    resolutionReason: resolution.reason,
+  };
+}
+
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
   return Buffer.concat(chunks).toString();
 }
-
-// --- Route handlers ---
 
 async function handleProxy(
   req: IncomingMessage,
@@ -279,34 +436,47 @@ async function handleProxy(
     return;
   }
 
-  // Track the chat session ID for per-chat binding
   const chatSessionId = getChatSessionId(req);
   if (chatSessionId) lastSeenChatSessionId = chatSessionId;
 
-  // Session resolution order: explicit x-llm-session header > per-chat binding > global active
-  const requestedSession = getRequestedSessionName(req)
-    ?? (chatSessionId ? chatSessionMap[chatSessionId] : undefined)
-    ?? null;
-  const session = getScopedSession(requestedSession);
+  const resolution = resolveHttpRouting(req, body, chatSessionId);
+  const session = getScopedSession(resolution.requestedSession);
   if (!session) {
-    res.writeHead(requestedSession ? 404 : 503, { "content-type": "application/json" });
+    const errorType = resolution.requestedSession ? "session_not_found" : "no_active_session";
+    const message = resolution.requestedSession
+      ? `Session '${resolution.requestedSession}' not found.`
+      : "No active session. Use 'llm-switcher add' to add one.";
+    const activeForError = getActiveSession();
+    if (activeForError) {
+      recordSessionError(activeForError, {
+        requestedModel: resolution.requestedModel,
+        ...getRoutingReasonData(resolution),
+        type: errorType,
+        message,
+        status: resolution.requestedSession ? 404 : 503,
+      });
+    }
+    res.writeHead(resolution.requestedSession ? 404 : 503, {
+      "content-type": "application/json",
+      ...(resolution.reason ? { "x-llm-routing-reason": resolution.reason } : {}),
+    });
     res.end(JSON.stringify({
       error: {
-        type: requestedSession ? "session_not_found" : "no_active_session",
-        message: requestedSession
-          ? `Session '${requestedSession}' not found.`
-          : "No active session. Use 'llm-switcher add' to add one.",
+        type: errorType,
+        message,
       },
     }));
     return;
   }
 
+  const routingHeaders = sessionUsedHeader(session.name, resolution.reason);
+  const routingData = getRoutingReasonData(resolution);
+
   if (session.provider === "openai") {
-    return handleOpenAIProxy(res, body, session, deps);
+    return handleOpenAIProxy(res, body, session, deps, routingHeaders, routingData);
   }
 
   const requestedModel = typeof body.model === "string" ? body.model : null;
-
   const token = session.token;
   const baseUrl = session.base_url || "https://api.anthropic.com";
   const incomingHeaders: Record<string, string> = {};
@@ -314,12 +484,10 @@ async function handleProxy(
     if (typeof v === "string") incomingHeaders[k] = v;
   }
 
-  // Apply model override
   if (session.model_override && !body.model) {
     body.model = session.model_override;
   }
 
-  // Inject billing header for OAuth
   body = injectBillingHeader({ ...body }, token);
 
   const upstreamUrl = getUpstreamUrl(baseUrl);
@@ -340,13 +508,13 @@ async function handleProxy(
       recordSessionSuccess(session, {
         requestedModel,
         effectiveModel,
+        ...routingData,
       });
-      // Stream SSE passthrough (only for successful responses)
       res.writeHead(upstreamRes.status, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         "connection": "keep-alive",
-        ...sessionUsedHeader(session.name),
+        ...routingHeaders,
       });
       const reader = upstreamRes.body.getReader();
       const decoder = new TextDecoder();
@@ -357,104 +525,88 @@ async function handleProxy(
       }
       res.end();
     } else {
-      // JSON passthrough (errors always returned as JSON so Claude Code doesn't hang)
-      const responseBody = await upstreamRes.text();
-      try {
-        const parsed = JSON.parse(responseBody);
-        if (upstreamRes.ok) {
-          recordSessionSuccess(session, {
-            requestedModel,
-            effectiveModel: parsed.model || effectiveModel,
-            usage: parsed.usage || null,
-          });
-        } else {
-          recordSessionError(session, {
-            requestedModel,
-            effectiveModel,
-            type: parsed.error?.type || "api_error",
-            message: parsed.error?.message || `HTTP ${upstreamRes.status}`,
-            status: upstreamRes.status,
-          });
-        }
-      } catch {
-        if (upstreamRes.ok) {
-          recordSessionSuccess(session, {
-            requestedModel,
-            effectiveModel,
-          });
-        } else {
-          recordSessionError(session, {
-            requestedModel,
-            effectiveModel,
-            type: "api_error",
-            message: `HTTP ${upstreamRes.status}`,
-            status: upstreamRes.status,
-          });
-        }
-      }
+      const text = await upstreamRes.text();
       res.writeHead(upstreamRes.status, {
-        "content-type": "application/json",
-        ...sessionUsedHeader(session.name),
+        "content-type": upstreamRes.headers.get("content-type") || "application/json",
+        ...routingHeaders,
       });
-      res.end(responseBody);
+      res.end(text);
+
+      if (upstreamRes.ok) {
+        let parsed: any = null;
+        try {
+          parsed = text ? JSON.parse(text) : null;
+        } catch {
+          parsed = null;
+        }
+        recordSessionSuccess(session, {
+          requestedModel,
+          effectiveModel,
+          ...routingData,
+          usage: parsed?.usage || null,
+        });
+      } else {
+        let parsed: any = null;
+        try {
+          parsed = text ? JSON.parse(text) : null;
+        } catch {
+          parsed = null;
+        }
+        recordSessionError(session, {
+          requestedModel,
+          effectiveModel,
+          ...routingData,
+          type: parsed?.error?.type || "upstream_error",
+          message: parsed?.error?.message || `Upstream error ${upstreamRes.status}`,
+          status: upstreamRes.status,
+        });
+      }
     }
-  } catch (err: any) {
+  } catch (err) {
+    const effectiveModel = typeof body.model === "string" ? body.model : session.model_override || null;
     recordSessionError(session, {
       requestedModel,
-      effectiveModel: typeof body.model === "string" ? body.model : session.model_override || null,
+      effectiveModel,
+      ...routingData,
       type: "upstream_connection_error",
-      message: err.message,
-      status: 502,
+      message: err instanceof Error ? err.message : String(err),
     });
-    res.writeHead(502, {
-      "content-type": "application/json",
-      ...sessionUsedHeader(session.name),
-    });
-    res.end(JSON.stringify({ error: { type: "upstream_connection_error", message: err.message } }));
+    res.writeHead(502, { "content-type": "application/json", ...routingHeaders });
+    res.end(JSON.stringify({ error: { type: "upstream_connection_error", message: err instanceof Error ? err.message : String(err) } }));
+    return;
   }
 }
 
 async function handleOpenAIProxy(
   res: ServerResponse,
-  body: any,
-  session: any,
+  requestBody: any,
+  session: { name: string; token: string; model_override?: string; account_id?: string },
   deps: Required<ProxyDeps>,
+  responseHeaders: Record<string, string> = sessionUsedHeader(session.name),
+  routingData: { resolvedSession?: string | null; inferredProvider?: Session["provider"] | null; resolutionReason?: RoutingReason | null } = {},
 ): Promise<void> {
-  const requestedModel = typeof body.model === "string" ? body.model : null;
-  let translated: { url: string; headers: Record<string, string>; body: string };
+  let translated;
   try {
-    translated = translateRequest(body, session);
-  } catch (err: any) {
-    recordSessionError(session, {
-      requestedModel,
-      effectiveModel: session.model_override || null,
-      type: "invalid_request",
-      message: err.message,
-      status: 422,
-    });
-    res.writeHead(422, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: { type: "invalid_request", message: err.message } }));
+    translated = translateRequest(requestBody, session);
+  } catch (err) {
+    res.writeHead(400, { "content-type": "application/json", ...responseHeaders });
+    res.end(JSON.stringify({ error: { type: "invalid_request", message: (err as Error).message } }));
     return;
   }
 
-  const isStream = body.stream === true;
-  const requestBody = JSON.parse(translated.body);
-  const effectiveModel = typeof requestBody.model === "string" ? requestBody.model : session.model_override || null;
-  // Always stream over WebSocket, we'll collect if non-streaming was requested
-  requestBody.stream = true;
-
+  const isStream = requestBody.stream === true;
   const ws = deps.openAIWsFactory(translated.url, { headers: translated.headers });
-
-  const events: any[] = [];
   let responseDone = false;
   const processWsEvent = createWsEventProcessor();
+  const requestedModel = typeof requestBody.model === "string" ? requestBody.model : null;
+  const effectiveModel = typeof requestBody.model === "string" ? requestBody.model : session.model_override || null;
 
   function endResponse(status: number, body: any): void {
     if (responseDone) return;
     responseDone = true;
     res.writeHead(status, {
       "content-type": "application/json",
-      ...sessionUsedHeader(session.name),
+      ...responseHeaders,
     });
     res.end(JSON.stringify(body));
   }
@@ -466,7 +618,7 @@ async function handleOpenAIProxy(
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         "connection": "keep-alive",
-        ...sessionUsedHeader(session.name),
+        ...responseHeaders,
       });
     }
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -489,9 +641,9 @@ async function handleOpenAIProxy(
       recordSessionError(session, {
         requestedModel,
         effectiveModel,
-        type: "api_error",
+        ...routingData,
+        type: event.error?.type || "api_error",
         message: event.error?.message || "OpenAI error",
-        status: 502,
       });
       endResponse(502, { error: { type: "api_error", message: event.error?.message || "OpenAI error" } });
       ws.close();
@@ -500,11 +652,11 @@ async function handleOpenAIProxy(
 
     if (isStream) {
       processWsEvent(event, writeSSE);
-
       if (event.type === "response.completed") {
         recordSessionSuccess(session, {
           requestedModel,
-          effectiveModel: event.response?.model || effectiveModel,
+          effectiveModel,
+          ...routingData,
           usage: event.response?.usage || null,
         });
         processWsEvent({ type: "_finish" }, writeSSE);
@@ -512,19 +664,16 @@ async function handleOpenAIProxy(
         res.end();
         ws.close();
       }
-    } else {
-      events.push(event);
-
-      if (event.type === "response.completed") {
-        const anthropicRes = translateResponse(event.response);
-        recordSessionSuccess(session, {
-          requestedModel,
-          effectiveModel: anthropicRes.model || event.response?.model || effectiveModel,
-          usage: anthropicRes.usage || null,
-        });
-        endResponse(200, anthropicRes);
-        ws.close();
-      }
+    } else if (event.type === "response.completed") {
+      recordSessionSuccess(session, {
+        requestedModel,
+        effectiveModel,
+        ...routingData,
+        usage: event.response?.usage || null,
+      });
+      const anthropicRes = translateResponse(event.response);
+      endResponse(200, anthropicRes);
+      ws.close();
     }
   });
 
@@ -533,24 +682,24 @@ async function handleOpenAIProxy(
     recordSessionError(session, {
       requestedModel,
       effectiveModel,
+      ...routingData,
       type: "upstream_connection_error",
       message: err.message,
-      status: 502,
     });
     endResponse(502, { error: { type: "upstream_connection_error", message: err.message } });
   });
 
-  ws.on("close", (code, reason) => {
-    if (!responseDone) {
+  ws.on("close", (code) => {
+    if (!responseDone && code !== 1000) {
       recordSessionError(session, {
         requestedModel,
         effectiveModel,
-        type: "upstream_connection_error",
-        message: `WebSocket closed: ${code} ${reason}`,
-        status: 502,
+        ...routingData,
+        type: "upstream_closed",
+        message: `Upstream WebSocket closed unexpectedly (${code})`,
       });
+      endResponse(502, { error: { type: "upstream_closed", message: `Upstream WebSocket closed unexpectedly (${code})` } });
     }
-    endResponse(502, { error: { type: "upstream_connection_error", message: `WebSocket closed: ${code} ${reason}` } });
   });
 }
 
@@ -559,188 +708,219 @@ async function handleModels(
   res: ServerResponse,
   deps: Required<ProxyDeps>,
 ): Promise<void> {
-  const requestedSession = getRequestedSessionName(req);
+  const requestedSession = getRequestedSessionName(req) ?? null;
   const session = getScopedSession(requestedSession);
   if (!session) {
     res.writeHead(requestedSession ? 404 : 503, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: requestedSession ? `Session '${requestedSession}' not found` : "No active session" }));
+    res.end(JSON.stringify({
+      error: {
+        type: requestedSession ? "session_not_found" : "no_active_session",
+        message: requestedSession
+          ? `Session '${requestedSession}' not found.`
+          : "No active session. Use 'llm-switcher add' to add one.",
+      },
+    }));
     return;
   }
 
-  const baseUrl = session.base_url || (session.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com");
-  const queryString = req.url?.includes("?") ? req.url.split("?")[1] : "";
-  const url = `${baseUrl}/v1/models${queryString ? "?" + queryString : ""}`;
-
-  let headers: Record<string, string>;
   if (session.provider === "openai") {
-    const accountId = session.account_id || "";
-    headers = buildCodexHeaders(session.token, accountId);
-  } else {
-    headers = buildUpstreamHeaders(session.token, {});
+    const headers = buildCodexHeaders(session.token, session.account_id || "");
+    headers["content-type"] = "application/json";
+    try {
+      const upstreamRes = await deps.fetchImpl("https://api.openai.com/v1/models", {
+        method: "GET",
+        headers,
+      });
+      const text = await upstreamRes.text();
+      res.writeHead(upstreamRes.status, {
+        "content-type": upstreamRes.headers.get("content-type") || "application/json",
+        ...sessionUsedHeader(session.name),
+      });
+      res.end(text);
+    } catch (err) {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "upstream_connection_error", message: err instanceof Error ? err.message : String(err) } }));
+    }
+    return;
   }
 
+  const incomingHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (typeof v === "string") incomingHeaders[k] = v;
+  }
+
+  const baseUrl = session.base_url || "https://api.anthropic.com";
+  const upstreamUrl = `${baseUrl}/v1/models${new URL(req.url || "/v1/models", "http://127.0.0.1").search}`;
+  const upstreamHeaders = buildUpstreamHeaders(session.token, incomingHeaders);
+
   try {
-    const upstreamRes = await deps.fetchImpl(url, { headers });
-    const body = await upstreamRes.text();
+    const upstreamRes = await deps.fetchImpl(upstreamUrl, {
+      method: "GET",
+      headers: upstreamHeaders,
+    });
+    const text = await upstreamRes.text();
     res.writeHead(upstreamRes.status, {
-      "content-type": "application/json",
+      "content-type": upstreamRes.headers.get("content-type") || "application/json",
       ...sessionUsedHeader(session.name),
     });
-    res.end(body);
-  } catch (err: any) {
-    res.writeHead(502, {
-      "content-type": "application/json",
-      ...sessionUsedHeader(session.name),
-    });
-    res.end(JSON.stringify({ error: err.message }));
+    res.end(text);
+  } catch (err) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "upstream_connection_error", message: err instanceof Error ? err.message : String(err) } }));
   }
 }
 
-async function runAnthropicProbe(session: any, deps: Required<ProxyDeps>): Promise<SessionProbeStatus> {
-  const startedAt = Date.now();
-  const token = session.token;
-  const baseUrl = session.base_url || "https://api.anthropic.com";
-  const headers = buildUpstreamHeaders(token, {});
+async function runAnthropicProbe(
+  session: Session & { name: string },
+  deps: Required<ProxyDeps>,
+): Promise<SessionProbeStatus> {
+  const started = Date.now();
   const body = injectBillingHeader({
-    model: "claude-haiku-4-5-20251001",
+    model: session.model_override || "claude-haiku-4-5-20251001",
     max_tokens: 1,
     messages: [{ role: "user", content: "ping" }],
-  }, token);
+  }, session.token);
 
   try {
-    const upstreamRes = await deps.fetchImpl(getUpstreamUrl(baseUrl), {
+    const upstreamRes = await deps.fetchImpl(getUpstreamUrl(session.base_url || "https://api.anthropic.com"), {
       method: "POST",
-      headers,
+      headers: buildUpstreamHeaders(session.token, {}),
       body: JSON.stringify(body),
     });
+    updateRateLimits(session.name, upstreamRes.headers);
     const probeRateLimits = extractRateLimits(upstreamRes.headers);
-    if (Object.keys(probeRateLimits).length > 0) rateLimits[session.name] = probeRateLimits;
     return {
       ok: upstreamRes.ok,
       status: upstreamRes.status,
       health_state: upstreamRes.ok ? "healthy" : "unhealthy",
       health_message: upstreamRes.ok ? "Healthy" : `Unhealthy: HTTP ${upstreamRes.status}`,
       checked_at: new Date().toISOString(),
-      latency_ms: Date.now() - startedAt,
-      rate_limits: probeRateLimits,
+      latency_ms: Date.now() - started,
+      rate_limits: Object.keys(probeRateLimits).length > 0 ? probeRateLimits : rateLimits[session.name] || {},
     };
-  } catch (err: any) {
+  } catch (err) {
     return {
       ok: false,
-      status: 0,
+      status: null,
       health_state: "unhealthy",
-      health_message: "Unhealthy: probe failed",
-      reason: err.message,
+      health_message: `Unhealthy: ${err instanceof Error ? err.message : String(err)}`,
       checked_at: new Date().toISOString(),
-      latency_ms: Date.now() - startedAt,
+      latency_ms: Date.now() - started,
       rate_limits: rateLimits[session.name] || {},
     };
   }
 }
 
-async function runOpenAIProbe(session: any, deps: Required<ProxyDeps>): Promise<SessionProbeStatus> {
-  const startedAt = Date.now();
-  let translated: { url: string; headers: Record<string, string>; body: string };
+async function runOpenAIProbe(
+  session: Session & { name: string },
+  deps: Required<ProxyDeps>,
+): Promise<SessionProbeStatus> {
+  const started = Date.now();
   try {
-    translated = translateRequest({
-      model: "claude-haiku-4-5-20251001",
-      stream: false,
+    const translated = translateRequest({
+      model: "unused-for-openai-session-selection",
+      stream: true,
       messages: [{ role: "user", content: "ping" }],
     }, session);
-  } catch (err: any) {
+
+    return await new Promise<SessionProbeStatus>((resolve) => {
+      const ws = deps.openAIWsFactory(translated.url, { headers: translated.headers });
+      let resolved = false;
+      const finish = (status: SessionProbeStatus) => {
+        if (resolved) return;
+        resolved = true;
+        resolve(status);
+      };
+
+      ws.on("open", () => {
+        ws.send(JSON.stringify({ type: "response.create", ...JSON.parse(translated.body) }));
+      });
+
+      ws.on("message", (data) => {
+        let event: any;
+        try {
+          event = JSON.parse(data.toString());
+        } catch {
+          return;
+        }
+
+        if (event.type === "error") {
+          finish({
+            ok: false,
+            status: null,
+            health_state: "unhealthy",
+            health_message: `Unhealthy: ${event.error?.message || "OpenAI error"}`,
+            checked_at: new Date().toISOString(),
+            latency_ms: Date.now() - started,
+            rate_limits: rateLimits[session.name] || {},
+          });
+          ws.close();
+          return;
+        }
+
+        if (event.type === "response.completed") {
+          finish({
+            ok: true,
+            status: 200,
+            health_state: "healthy",
+            health_message: "Healthy",
+            checked_at: new Date().toISOString(),
+            latency_ms: Date.now() - started,
+            rate_limits: rateLimits[session.name] || {},
+          });
+          ws.close();
+        }
+      });
+
+      ws.on("error", (err) => {
+        finish({
+          ok: false,
+          status: null,
+          health_state: "unhealthy",
+          health_message: `Unhealthy: ${err.message}`,
+          checked_at: new Date().toISOString(),
+          latency_ms: Date.now() - started,
+          rate_limits: rateLimits[session.name] || {},
+        });
+      });
+
+      ws.on("close", (code) => {
+        if (!resolved) {
+          finish({
+            ok: false,
+            status: null,
+            health_state: "unhealthy",
+            health_message: `Unhealthy: WebSocket closed ${code}`,
+            checked_at: new Date().toISOString(),
+            latency_ms: Date.now() - started,
+            rate_limits: rateLimits[session.name] || {},
+          });
+        }
+      });
+    });
+  } catch (err) {
     return {
       ok: false,
-      status: 422,
+      status: null,
       health_state: "unhealthy",
-      health_message: `Unhealthy: ${err.message}`,
-      reason: err.message,
+      health_message: `Unhealthy: ${err instanceof Error ? err.message : String(err)}`,
       checked_at: new Date().toISOString(),
-      latency_ms: Date.now() - startedAt,
+      latency_ms: Date.now() - started,
       rate_limits: rateLimits[session.name] || {},
     };
   }
-
-  const requestBody = JSON.parse(translated.body);
-  requestBody.stream = true;
-
-  return await new Promise((resolve) => {
-    const ws = deps.openAIWsFactory(translated.url, { headers: translated.headers });
-    let done = false;
-    const finish = (status: SessionProbeStatus) => {
-      if (done) return;
-      done = true;
-      setProbeStatus(session.name, status);
-      resolve(status);
-    };
-
-    ws.on("open", () => {
-      ws.send(JSON.stringify({ type: "response.create", ...requestBody }));
-    });
-
-    ws.on("message", (data) => {
-      let event: any;
-      try {
-        event = JSON.parse(data.toString());
-      } catch {
-        return;
-      }
-      if (event.type === "error") {
-        finish({
-          ok: false,
-          status: 502,
-          health_state: "unhealthy",
-          health_message: `Unhealthy: ${event.error?.message || "OpenAI error"}`,
-          reason: event.error?.message || "OpenAI error",
-          checked_at: new Date().toISOString(),
-          latency_ms: Date.now() - startedAt,
-          rate_limits: rateLimits[session.name] || {},
-        });
-        ws.close();
-        return;
-      }
-      if (event.type === "response.completed") {
-        finish({
-          ok: true,
-          status: 200,
-          health_state: "healthy",
-          health_message: "Healthy",
-          checked_at: new Date().toISOString(),
-          latency_ms: Date.now() - startedAt,
-          rate_limits: rateLimits[session.name] || {},
-        });
-        ws.close();
-      }
-    });
-
-    ws.on("error", (err) => {
-      finish({
-        ok: false,
-        status: 502,
-        health_state: "unhealthy",
-        health_message: `Unhealthy: ${err.message}`,
-        reason: err.message,
-        checked_at: new Date().toISOString(),
-        latency_ms: Date.now() - startedAt,
-        rate_limits: rateLimits[session.name] || {},
-      });
-    });
-
-    ws.on("close", (code, reason) => {
-      finish({
-        ok: false,
-        status: code || 502,
-        health_state: "unhealthy",
-        health_message: `Unhealthy: WebSocket closed ${code}`,
-        reason: reason.toString(),
-        checked_at: new Date().toISOString(),
-        latency_ms: Date.now() - startedAt,
-        rate_limits: rateLimits[session.name] || {},
-      });
-    });
-  });
 }
 
-async function runSessionProbe(session: any, deps: Required<ProxyDeps>): Promise<SessionProbeStatus> {
+const PROBE_TTL_MS = 60_000;
+
+async function runSessionProbe(
+  session: Session & { name: string },
+  deps: Required<ProxyDeps>,
+): Promise<SessionProbeStatus> {
+  const cached = getProbeStatus(session.name);
+  if (cached.checked_at && Date.now() - new Date(cached.checked_at).getTime() < PROBE_TTL_MS) {
+    return cached;
+  }
   const status = session.provider === "openai"
     ? await runOpenAIProbe(session, deps)
     : await runAnthropicProbe(session, deps);
@@ -748,10 +928,13 @@ async function runSessionProbe(session: any, deps: Required<ProxyDeps>): Promise
   return status;
 }
 
-async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: string, deps: Required<ProxyDeps>): Promise<void> {
-  res.setHeader("content-type", "application/json");
+async function handleAdmin(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: Required<ProxyDeps>,
+): Promise<void> {
+  const path = req.url || "/";
 
-  // GET /admin/sessions
   if (req.method === "GET" && (path === "/admin/sessions" || path.startsWith("/admin/sessions?"))) {
     const { sessions, active_session } = listSessions();
     const wantHealth = new URL(req.url || "/", "http://127.0.0.1").searchParams.get("health") === "true";
@@ -772,41 +955,39 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
     return;
   }
 
-  // POST /admin/sessions
   if (req.method === "POST" && path === "/admin/sessions") {
     const body = JSON.parse(await readBody(req));
     if (!body.name || !body.provider || !body.token) {
-      res.writeHead(422);
-      res.end(JSON.stringify({ error: "Fields 'name', 'provider', and 'token' are required." }));
+      res.writeHead(422, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "invalid_request", message: "name, provider, and token are required" } }));
       return;
     }
-    addSession(body.name, body.provider, body.token, body.base_url, body.model_override);
-    res.end(JSON.stringify({ status: "ok", message: `Session '${body.name}' added.` }));
+    addSession(body.name, body.provider, body.token, body.base_url, body.model_override, body.account_id);
+    res.writeHead(201, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
 
-  // DELETE /admin/sessions/:name
   if (req.method === "DELETE" && path.startsWith("/admin/sessions/")) {
     const name = decodeURIComponent(path.slice("/admin/sessions/".length));
     removeSession(name);
-    res.end(JSON.stringify({ status: "ok", message: `Session '${name}' removed.` }));
+    res.writeHead(204);
+    res.end();
     return;
   }
 
-  // POST /admin/switch/:name
   if (req.method === "POST" && path.startsWith("/admin/switch/")) {
     const name = decodeURIComponent(path.slice("/admin/switch/".length));
     try {
       setActive(name);
-      res.end(JSON.stringify({ status: "ok", message: `Active session set to '${name}'.` }));
-    } catch (err: any) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ error: err.message }));
+      res.end(JSON.stringify({ ok: true, active_session: name }));
+    } catch (err) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "session_not_found", message: (err as Error).message } }));
     }
     return;
   }
 
-  // GET /admin/status
   if (req.method === "GET" && path === "/admin/status") {
     const session = getActiveSession();
     const { sessions } = listSessions();
@@ -834,206 +1015,170 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, path: stri
     return;
   }
 
-  // POST /admin/chat-bind/:chat-session-id/:session-name
-  if (req.method === "POST" && path.startsWith("/admin/chat-bind/")) {
-    const rest = path.slice("/admin/chat-bind/".length);
-    const slashIdx = rest.indexOf("/");
-    if (slashIdx === -1) {
-      res.writeHead(422);
-      res.end(JSON.stringify({ error: "Expected /admin/chat-bind/:chat-session-id/:session-name" }));
-      return;
-    }
-    const chatId = decodeURIComponent(rest.slice(0, slashIdx));
-    const sessionName = decodeURIComponent(rest.slice(slashIdx + 1));
-    const { sessions } = listSessions();
-    if (!sessions[sessionName]) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ error: `Session '${sessionName}' not found.` }));
-      return;
-    }
-    chatSessionMap[chatId] = sessionName;
-    res.end(JSON.stringify({ status: "ok", message: `Chat '${chatId}' bound to session '${sessionName}'.` }));
-    return;
-  }
-
-  // DELETE /admin/chat-bind/:chat-session-id
-  if (req.method === "DELETE" && path.startsWith("/admin/chat-bind/")) {
-    const chatId = decodeURIComponent(path.slice("/admin/chat-bind/".length));
-    delete chatSessionMap[chatId];
-    res.end(JSON.stringify({ status: "ok", message: `Chat '${chatId}' unbound.` }));
-    return;
-  }
-
-  // GET /admin/chat-sessions
-  if (req.method === "GET" && path === "/admin/chat-sessions") {
-    res.end(JSON.stringify({ chat_sessions: chatSessionMap, last_seen_chat_id: lastSeenChatSessionId }));
-    return;
-  }
-
-  // GET /admin/rate-limits
-  // Pings each session with GET /v1/models (no tokens consumed) to refresh rate-limit headers.
-  if (req.method === "GET" && path === "/admin/rate-limits") {
-    const { sessions } = listSessions();
-    const result = Object.fromEntries(
-      await Promise.all(
-        Object.entries(sessions).map(async ([name, session]) => {
-          const probe = await runSessionProbe({ name, ...session }, deps);
-          return [name, probe] as const;
-        }),
-      ),
-    );
-
-    res.end(JSON.stringify({ rate_limits: result }));
-    return;
-  }
-
-  // GET /admin/recent-chat-id
   if (req.method === "GET" && path === "/admin/recent-chat-id") {
-    if (!lastSeenChatSessionId) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ error: "No chat session seen yet." }));
-      return;
-    }
     res.end(JSON.stringify({ chat_session_id: lastSeenChatSessionId }));
     return;
   }
 
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: "Not found" }));
+  if (req.method === "POST" && path.startsWith("/admin/chat-bind/")) {
+    const rest = path.slice("/admin/chat-bind/".length);
+    const slash = rest.indexOf("/");
+    if (slash <= 0) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "invalid_request", message: "Expected /admin/chat-bind/<chat-session-id>/<session-name>" } }));
+      return;
+    }
+    const chatSessionId = decodeURIComponent(rest.slice(0, slash));
+    const sessionName = decodeURIComponent(rest.slice(slash + 1));
+    const session = getScopedSession(sessionName);
+    if (!session) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "session_not_found", message: `Session '${sessionName}' not found.` } }));
+      return;
+    }
+    chatSessionMap[chatSessionId] = sessionName;
+    res.end(JSON.stringify({ ok: true, chat_session_id: chatSessionId, session: sessionName }));
+    return;
+  }
+
+  if (req.method === "GET" && path === "/admin/rate-limits") {
+    const { sessions } = listSessions();
+    const result = Object.fromEntries(
+      await Promise.all(
+        Object.entries(sessions).map(async ([name, session]) => [
+          name,
+          await runSessionProbe({ name, ...session }, deps),
+        ] as const),
+      ),
+    );
+    res.end(JSON.stringify({ rate_limits: result }));
+    return;
+  }
+
+  res.writeHead(404, { "content-type": "application/json" });
+  res.end(JSON.stringify({ error: { type: "not_found", message: "Unknown admin route" } }));
 }
 
-// --- Server factory ---
+function handleWs(
+  req: IncomingMessage,
+  socket: any,
+  head: Buffer,
+  wss: WebSocketServer,
+  deps: Required<ProxyDeps>,
+) {
+  const requestedSession = getRequestedWsSessionName(req);
+  const session = getScopedSession(requestedSession);
+  if (!session) {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  if (session.provider !== "openai") {
+    socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+    socket.destroy();
+    return;
+  }
 
-export function createProxyServer(overrides: ProxyDeps = {}) {
-  const deps: Required<ProxyDeps> = {
-    fetchImpl: overrides.fetchImpl ?? fetch,
-    openAIWsFactory: overrides.openAIWsFactory ?? ((url, options) => new WsWebSocket(url, options)),
-    codexBridgeWsFactory: overrides.codexBridgeWsFactory ?? ((url, options) => new WsWebSocket(url, options)),
-    codexBridgeUrl: overrides.codexBridgeUrl ?? "wss://chatgpt.com/backend-api/codex/responses",
-  };
+  const upstreamUrl = deps.codexBridgeUrl || "wss://chatgpt.com/backend-api/codex/responses";
+  const upstreamHeaders = buildCodexHeaders(session.token, session.account_id || "");
+  const buffered: Array<{ data: any; isBinary: boolean }> = [];
 
-  const server = createServer(async (req, res) => {
-    const url = req.url || "/";
+  const upstreamWs = deps.codexBridgeWsFactory(upstreamUrl, { headers: upstreamHeaders });
 
-    // Health check (Claude Code sends HEAD / before requests)
-    if ((req.method === "HEAD" || req.method === "GET") && url === "/") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(req.method === "HEAD" ? undefined : JSON.stringify({ status: "ok" }));
-      return;
-    }
-
-    // Proxy route for Anthropic (match with or without query params)
-    if (req.method === "POST" && (url === "/v1/messages" || url.startsWith("/v1/messages?"))) {
-      return handleProxy(req, res, deps);
-    }
-
-    // Model discovery for Codex
-    if (req.method === "GET" && url.startsWith("/v1/models")) {
-      return handleModels(req, res, deps);
-    }
-
-    // Admin routes
-    if (url.startsWith("/admin/")) {
-      return handleAdmin(req, res, url, deps);
-    }
-
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found" }));
-  });
-
-  // WebSocket proxy for Codex (/v1/responses)
-  const wss = new WebSocketServer({ server, path: "/responses" });
-
-  wss.on("connection", (clientWs, req) => {
-    const requestedSession = getRequestedWsSessionName(req);
-    const session = getScopedSession(requestedSession);
-    if (!session) {
-      clientWs.close(
-        requestedSession ? 4004 : 4003,
-        requestedSession ? `Session '${requestedSession}' not found` : "No active OpenAI session",
-      );
-      return;
-    }
-    if (session.provider !== "openai") {
-      clientWs.close(4003, "No active OpenAI session");
-      return;
-    }
-
-    const accountId = session.account_id || "";
-
-    // Build upstream headers from session + forward incoming headers
-    const incomingHeaders: Record<string, string> = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (typeof v === "string") incomingHeaders[k.toLowerCase()] = v;
-    }
-
-    const upstreamHeaders = buildCodexHeaders(session.token, accountId, incomingHeaders);
-
-    // Codex OAuth tokens use chatgpt.com backend
-    const upstreamWs = deps.codexBridgeWsFactory(deps.codexBridgeUrl, {
-      headers: upstreamHeaders,
+  wss.handleUpgrade(req, socket, head, (clientWs) => {
+    clientWs.on("message", (data, isBinary) => {
+      if (upstreamWs.readyState === upstreamWs.OPEN) {
+        upstreamWs.send(data, { binary: isBinary });
+      } else {
+        buffered.push({ data, isBinary });
+      }
     });
 
-    let upstreamReady = false;
-    const buffered: (string | Buffer)[] = [];
-
     upstreamWs.on("open", () => {
-      upstreamReady = true;
-      // Flush buffered messages
-      for (const msg of buffered) {
-        upstreamWs.send(msg);
-      }
+      for (const msg of buffered) upstreamWs.send(msg.data, { binary: msg.isBinary });
       buffered.length = 0;
     });
 
-    // Client → Upstream (preserve text/binary frame type)
-    clientWs.on("message", (data, isBinary) => {
-      const msg = isBinary ? data : data.toString();
-      if (upstreamReady) {
-        upstreamWs.send(msg);
-      } else {
-        buffered.push(msg as any);
-      }
-    });
-
-    // Upstream → Client (preserve text/binary frame type)
     upstreamWs.on("message", (data, isBinary) => {
-      if (clientWs.readyState === clientWs.OPEN) {
-        clientWs.send(isBinary ? data : data.toString());
+      clientWs.send(data, { binary: isBinary });
+    });
+
+    clientWs.on("close", (code, reason) => {
+      if (upstreamWs.readyState === upstreamWs.OPEN || upstreamWs.readyState === upstreamWs.CONNECTING) {
+        upstreamWs.close(code, reason.toString());
       }
     });
 
-    // Error handling
-    upstreamWs.on("error", (err) => {
-      console.error("Upstream WebSocket error:", err.message);
-      clientWs.close(4502, "Upstream connection error");
-    });
-
-    clientWs.on("error", (err) => {
-      console.error("Client WebSocket error:", err.message);
-      upstreamWs.close();
-    });
-
-    // Close propagation
     upstreamWs.on("close", (code, reason) => {
-      if (clientWs.readyState === clientWs.OPEN) {
+      if (clientWs.readyState === clientWs.OPEN || clientWs.readyState === clientWs.CONNECTING) {
         clientWs.close(code, reason.toString());
       }
     });
 
-    clientWs.on("close", () => {
-      if (upstreamWs.readyState === upstreamWs.OPEN) {
+    clientWs.on("error", () => {
+      if (upstreamWs.readyState === upstreamWs.OPEN || upstreamWs.readyState === upstreamWs.CONNECTING) {
         upstreamWs.close();
       }
     });
+
+    upstreamWs.on("error", () => {
+      if (clientWs.readyState === clientWs.OPEN || clientWs.readyState === clientWs.CONNECTING) {
+        clientWs.close();
+      }
+    });
+  });
+}
+
+export function createProxyServer(customDeps: ProxyDeps = {}) {
+  const deps: Required<ProxyDeps> = {
+    fetchImpl: customDeps.fetchImpl || fetch,
+    openAIWsFactory: customDeps.openAIWsFactory || ((url, options) => new WsWebSocket(url, options)),
+    codexBridgeWsFactory: customDeps.codexBridgeWsFactory || ((url, options) => new WsWebSocket(url, options)),
+    codexBridgeUrl: customDeps.codexBridgeUrl || "wss://chatgpt.com/backend-api/codex/responses",
+  };
+
+  const server = createServer(async (req, res) => {
+    if (!req.url) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "invalid_request", message: "Missing URL." } }));
+      return;
+    }
+
+    const path = new URL(req.url, "http://127.0.0.1").pathname;
+
+    if ((req.method === "GET" || req.method === "HEAD") && path === "/") {
+      res.writeHead(200, { "content-type": "application/json" });
+      if (req.method === "HEAD") return res.end();
+      return res.end(JSON.stringify({ status: "ok" }));
+    }
+
+    if (path.startsWith("/admin/")) {
+      return handleAdmin(req, res, deps);
+    }
+
+    if (req.method === "POST" && path === "/v1/messages") {
+      return handleProxy(req, res, deps);
+    }
+
+    if (req.method === "GET" && path === "/v1/models") {
+      return handleModels(req, res, deps);
+    }
+
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "not_found", message: `Unknown route ${path}` } }));
+  });
+
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on("upgrade", (req, socket, head) => {
+    const path = new URL(req.url || "/responses", "http://127.0.0.1").pathname;
+    if (path !== "/responses") {
+      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    handleWs(req, socket, head, wss, deps);
   });
 
   return server;
-}
-
-export function startServer(port: number = 8411): void {
-  const server = createProxyServer();
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`LLM Switcher proxy running on http://127.0.0.1:${port}`);
-  });
 }
