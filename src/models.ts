@@ -18,6 +18,21 @@ const ANTHROPIC_FALLBACK_MODELS = [
   "claude-3-5-haiku",
 ];
 
+export function inferProviderFromModel(model: string): Session["provider"] | null {
+  if (model.startsWith("claude-")) return "anthropic";
+  if (model.startsWith("gpt-") || /^o\d/i.test(model)) return "openai";
+  return null;
+}
+
+export function pickDeterministicSessionName(
+  names: string[],
+  activeSessionName?: string | null,
+): string | null {
+  if (names.length === 0) return null;
+  if (activeSessionName && names.includes(activeSessionName)) return activeSessionName;
+  return [...names].sort()[0] || null;
+}
+
 export function getFallbackModels(provider: Session["provider"]): string[] {
   return provider === "anthropic" ? ANTHROPIC_FALLBACK_MODELS : OPENAI_FALLBACK_MODELS;
 }
