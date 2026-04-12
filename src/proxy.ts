@@ -593,7 +593,7 @@ async function handleOpenAIProxy(
   let responseDone = false;
   const processWsEvent = createWsEventProcessor();
   const requestedModel = typeof requestBody.model === "string" ? requestBody.model : null;
-  const effectiveModel = session.model_override || null;
+  const effectiveModel = typeof requestBody.model === "string" ? requestBody.model : session.model_override || null;
 
   function endResponse(status: number, body: any): void {
     if (responseDone) return;
@@ -905,12 +905,16 @@ async function runOpenAIProbe(
   }
 }
 
+const PROBE_TTL_MS = 60_000;
+
 async function runSessionProbe(
   session: Session & { name: string },
   deps: Required<ProxyDeps>,
 ): Promise<SessionProbeStatus> {
   const cached = getProbeStatus(session.name);
-  if (cached.checked_at) return cached;
+  if (cached.checked_at && Date.now() - new Date(cached.checked_at).getTime() < PROBE_TTL_MS) {
+    return cached;
+  }
   const status = session.provider === "openai"
     ? await runOpenAIProbe(session, deps)
     : await runAnthropicProbe(session, deps);
