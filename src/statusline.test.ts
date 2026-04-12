@@ -25,7 +25,7 @@ const healthyFetch = createFetchStub({
   "/admin/status": {
     active_session: { name: "claude-default", provider: "anthropic" },
   },
-  "/admin/sessions?health=true": {
+  "/admin/sessions": {
     sessions: {
       "claude-default": {
         model_override: "claude-sonnet-4-5",
@@ -59,7 +59,7 @@ const fallbackFetch = createFetchStub({
   "/admin/status": {
     active_session: { name: "gpt-default", provider: "openai" },
   },
-  "/admin/sessions?health=true": {
+  "/admin/sessions": {
     sessions: {
       "gpt-default": {
         model_override: "gpt-4.1",
@@ -75,7 +75,7 @@ const fallbackFetch = createFetchStub({
 
 const offlineFetch = createFetchStub({
   "/admin/status": new Error("offline"),
-  "/admin/sessions?health=true": new Error("offline"),
+  "/admin/sessions": new Error("offline"),
 });
 
 describe("statusline helpers", () => {

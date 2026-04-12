@@ -100,7 +100,7 @@ export async function fetchProxySessions(
   fetchImpl: FetchLike,
 ): Promise<Record<string, SessionAdminView>> {
   try {
-    const res = await fetchImpl(new URL("/admin/sessions?health=true", baseUrl), {
+    const res = await fetchImpl(new URL("/admin/sessions", baseUrl), {
       signal: AbortSignal.timeout(1500),
     });
     if (!res.ok) return {};
