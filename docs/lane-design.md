@@ -23,6 +23,67 @@ The project needs an internal routing abstraction that:
 - lets child agents express intent without exposing low-level session selection
 - remains deterministic and debuggable
 
+## Current Claude Code Constraint
+
+Claude Code does not currently expose agent lineage to the proxy HTTP layer.
+
+The proxy can observe transport-level request data such as:
+
+- `x-llm-session`
+- `x-claude-code-session-id`
+- request `body.model`
+
+But it does **not** currently receive Claude Code internal fields such as:
+
+- `agent_id`
+- `parent_agent_id`
+- `agent_type`
+
+That means the proxy cannot yet create or manage true root-agent and subagent lane lifecycle state directly from current Claude Code request metadata.
+
+As a result, the full lane model in this document should be read as the target architecture, while the first practical implementation step must be based on the request-level signals the proxy can actually observe today.
+
+## Target Architecture
+
+The intended long-term model is still an internal lane abstraction with:
+
+- root lanes
+- child lane inheritance
+- fixed lane-to-session binding
+- explainable admin/debug visibility
+
+That architecture remains the goal, but it cannot be fully implemented until the client exposes a stable, proxy-visible way to distinguish root-agent and subagent request identity.
+
+## Phased Implementation
+
+### Phase 1: per-request model-based session resolution
+
+The first practical step should not try to invent hidden lane lifecycle state that the proxy cannot observe.
+
+Instead, phase 1 should route Claude Code requests using the only per-request differentiator that is currently available to the proxy: `body.model`.
+
+Recommended phase-1 behavior:
+
+1. keep explicit `x-llm-session` as the highest-priority override
+2. if no explicit session override exists, inspect `body.model`
+3. infer provider from built-in model/provider mapping when possible
+4. resolve a compatible session from the configured session pool
+5. if no model-based match exists, fall back to existing per-chat binding or global active session behavior
+6. keep this deterministic and avoid health-based failover in the first step
+
+This is not true lane identity. It is a request-scoped routing step that approximates stable subagent routing when a subagent keeps the same model for its lifetime.
+
+### Phase 2+: true lane lifecycle
+
+If Claude Code later exposes stable agent or lane identity to the proxy layer, or if another reliable lane key becomes available, the full lane model in this document becomes implementable:
+
+- automatic root/child lane creation
+- parent inheritance
+- fixed lane lifetime binding
+- lane-aware admin/debug introspection
+
+Until then, phase 1 should be treated as a stepping stone toward the target architecture, not as a claim that the proxy already has true lane lifecycle awareness.
+
 ## Goals
 
 1. Keep sessions as the user-managed backend/account objects.
@@ -32,6 +93,7 @@ The project needs an internal routing abstraction that:
 5. Resolve routing once per lane and keep it stable for the lane lifetime.
 6. Fail explicitly when routing hints cannot be satisfied.
 7. Keep the system explainable through admin/debug surfaces.
+8. Keep the first implementation grounded in signals the proxy can actually observe today.
 
 ## Non-Goals
 
@@ -41,6 +103,7 @@ The project needs an internal routing abstraction that:
 - policy-engine scheduling or weighted routing
 - multi-user tenancy
 - automatic failover after lane creation in the first iteration
+- pretending the current proxy can already observe Claude agent lineage when it cannot
 
 ## Core Concepts
 
@@ -106,6 +169,8 @@ Once a lane resolves to a session, that binding remains fixed for the lifetime o
 
 The lane should not silently drift to another session later because that would make agent behavior harder to understand.
 
+This section describes the target architecture, not what phase 1 can implement from current Claude Code HTTP metadata alone.
+
 ## Resolution Algorithm
 
 Recommended resolution order for a child lane:
@@ -130,6 +195,8 @@ This keeps the common path simple:
 - compatible hint -> keep parent session
 - incompatible hint -> resolve a different session once
 
+This algorithm describes the target lane-aware model. Phase 1 should instead use request `body.model` as the only currently available routing hint that varies across Claude Code subagent requests.
+
 ## Built-in Model/Provider Mapping
 
 `llm-switcher` should maintain a built-in model/provider mapping for provider inference.
@@ -148,6 +215,8 @@ Rules:
 
 This mapping should be inspectable through `llm-switcher` admin/debug interfaces so callers can understand what will resolve successfully.
 
+In phase 1, this mapping is also the key mechanism for per-request model-based session resolution.
+
 ## Failure Semantics
 
 The lane model should prefer explicit failure over silent degradation.
@@ -165,6 +234,8 @@ When routing fails:
 - the router must not silently fall back to the parent session, global default session, or another arbitrary session
 
 This is especially important when a caller explicitly asked for a provider or model.
+
+For phase 1, the same rule applies to request-level model-based session resolution: failure should be explicit when deterministic model/provider resolution is not possible.
 
 ## Observability and Debugging
 
@@ -185,6 +256,8 @@ Admin/debug visibility should make it possible to inspect:
 
 The exact admin API shape can be designed separately, but the data should be available.
 
+Phase 1 should not overclaim lane lifecycle visibility, but it should still make request resolution explainable, for example by exposing when a request was resolved by explicit session override versus model-based selection.
+
 ## Relationship to Existing Session Selection
 
 This lane model is additive.
@@ -203,6 +276,8 @@ In short:
 - the system manages lanes
 - lanes resolve to sessions
 
+In phase 1, request `body.model` acts as the first proxy-visible routing hint that can approximate subagent-specific routing before true lane identity exists.
+
 ## Implementation Impact
 
 Likely implementation touchpoints later include:
@@ -213,19 +288,27 @@ Likely implementation touchpoints later include:
 - tests in `src/proxy.test.ts`
 - statusline or panel consumers that need to distinguish requested context from resolved execution
 
+Near-term implementation should begin with per-request model-based resolution in `src/proxy.ts`, because that code already parses `body.model` early and already contains the existing session-selection path:
+
+- explicit `x-llm-session`
+- per-chat binding via `x-claude-code-session-id`
+- global active session
+
 The design doc is intentionally ahead of implementation so the terminology and failure semantics are fixed first.
 
 ## Current Recommendation
 
-Use lanes as an internal, agent-scoped routing scope.
+Use lanes as the target internal, agent-scoped routing scope.
 
-The first implementation should keep the model narrow:
+But implement the first step as request-scoped model-based session resolution, because that is what current Claude Code request metadata actually supports.
 
-- automatic lane creation for root agents and subagents
-- parent inheritance by default
-- child hints limited to `model` and `provider`
-- built-in model/provider inference when unambiguous
+That first implementation should keep the model narrow:
+
+- explicit session override remains highest priority
+- request `body.model` becomes the first lane-related routing hint
+- built-in model/provider inference remains deterministic
 - explicit failure on ambiguity or unsatisfied constraints
-- fixed lane-to-session binding for the lane lifetime
+- no health-based failover in the first step
+- full lane lifecycle remains future work contingent on proxy-visible lane identity
 
-That is enough to support future subagent routing without turning lanes into a new user-facing object.
+That keeps the architecture honest while still moving toward future subagent routing.
