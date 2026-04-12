@@ -71,8 +71,9 @@ program
     console.log(`Token found: ${token.slice(0, 20)}...`);
     console.log(`Account ID: ${accountId}`);
 
-    addSession(name, "openai", token, undefined, undefined, accountId);
-    console.log(`\u2713 Session '${name}' ready with Codex OAuth token`);
+    const refreshToken = auth.tokens.refresh_token;
+    addSession(name, "openai", token, undefined, undefined, accountId, refreshToken);
+    console.log(`\u2713 Session '${name}' ready with Codex OAuth token${refreshToken ? " (auto-refresh enabled)" : ""}`);
   });
 
 // --- add ---

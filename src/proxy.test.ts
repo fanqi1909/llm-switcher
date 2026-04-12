@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { createServer } from "node:http";
-import { once } from "node:events";
+import { once, EventEmitter } from "node:events";
 import { WebSocket, WebSocketServer } from "ws";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -601,6 +601,96 @@ describe("OpenAI proxy effectiveModel", () => {
         const sessionsRes = await request(baseUrl, "/admin/sessions");
         const body = JSON.parse(sessionsRes.text);
         assert.equal(body.sessions["gpt-work"].last_effective_model, "gpt-5.4");
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+});
+
+describe("OpenAI token auto-refresh on 401", () => {
+  it("refreshes token and retries when WS returns 401", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await once(upstreamServer.listen(0, "127.0.0.1"), "listening");
+    const addr = upstreamServer.address();
+    assert.ok(addr && typeof addr === "object");
+    const upstreamUrl = `ws://127.0.0.1:${addr.port}`;
+
+    let connectionCount = 0;
+    upstreamWss.on("connection", (ws) => {
+      connectionCount++;
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_refresh",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        }));
+      });
+    });
+
+    let wsCallCount = 0;
+    const expiredToken = "sk-expired";
+    const freshToken = "sk-fresh";
+    let refreshCalled = false;
+
+    const proxy = createProxyServer({
+      // First WS call with expired token → simulate 401; second call with fresh token → connect to real server
+      openAIWsFactory: (_url, options) => {
+        wsCallCount++;
+        const authHeader = (options?.headers as any)?.authorization ?? "";
+        if (authHeader.includes(expiredToken)) {
+          // Return a fake WS that immediately errors with 401
+          const fake = new EventEmitter() as any;
+          fake.send = () => {};
+          fake.close = () => {};
+          setImmediate(() => fake.emit("error", Object.assign(new Error("Unexpected server response: 401"), { statusCode: 401 })));
+          return fake;
+        }
+        return new WebSocket(upstreamUrl, options);
+      },
+      fetchImpl: async (url, init) => {
+        if (String(url).includes("oauth/token")) {
+          refreshCalled = true;
+          return new Response(JSON.stringify({ access_token: freshToken, refresh_token: "rt-new" }), {
+            status: 200, headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "codex",
+            provider: "openai",
+            token: expiredToken,
+            model_override: "gpt-5.4",
+            refresh_token: "rt-old",
+          }),
+        });
+
+        const res = await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-llm-session": "codex" },
+          body: JSON.stringify({ stream: false, messages: [{ role: "user", content: "hi" }] }),
+        });
+
+        assert.equal(res.status, 200, "should succeed after token refresh");
+        assert.equal(refreshCalled, true, "should have called token refresh endpoint");
+        assert.equal(wsCallCount, 2, "should have made two WS connections");
+        assert.equal(connectionCount, 1, "only the second WS should reach upstream");
       });
     } finally {
       await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
