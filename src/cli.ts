@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { addSession, removeSession, setActive, getActiveSession, getSession, listSessions, setSessionModel } from "./config.js";
-import { startServer } from "./proxy.js";
+import { createProxyServer } from "./proxy.js";
 import { sniffOAuthToken } from "./login.js";
 import { renderClaudeStatusline } from "./statusline.js";
 import { getDefaultClaudeCommandsDir, installClaudeCommand } from "./claude-command.js";
@@ -26,7 +26,10 @@ program
   .description("Start the LLM Switcher proxy server")
   .option("-p, --port <port>", "Port to listen on", "8411")
   .action((opts) => {
-    startServer(parseInt(opts.port, 10));
+    const port = parseInt(opts.port, 10);
+    createProxyServer().listen(port, "127.0.0.1", () => {
+      console.log(`LLM Switcher proxy running on http://127.0.0.1:${port}`);
+    });
   });
 
 // --- login ---
