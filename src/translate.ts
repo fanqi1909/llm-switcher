@@ -246,21 +246,28 @@ function translateToolChoice(choice: any): any {
 
 const PATH_FIELDS = ["file_path", "path"];
 
-function rewriteInputPaths(input: any, mapping: WorktreeMapping): any {
-  if (!input || typeof input !== "object") return input;
+function rewriteInputPaths(input: any, mapping: WorktreeMapping): { result: any; rewritten: boolean } {
+  if (!input || typeof input !== "object") return { result: input, rewritten: false };
   const result = { ...input };
+  let rewritten = false;
   for (const field of PATH_FIELDS) {
-    if (typeof result[field] === "string" && result[field].startsWith(mapping.original + "/")) {
+    if (
+      typeof result[field] === "string" &&
+      result[field].startsWith(mapping.original + "/") &&
+      !result[field].startsWith(mapping.worktree + "/")
+    ) {
       result[field] = mapping.worktree + result[field].slice(mapping.original.length);
+      rewritten = true;
     }
   }
-  return result;
+  return { result, rewritten };
 }
 
 // --- Non-Streaming Response Translation: OpenAI Responses → Anthropic ---
 
-export function translateResponse(openaiRes: any, mapping?: WorktreeMapping | null): any {
+export function translateResponse(openaiRes: any, mapping?: WorktreeMapping | null): { response: any; pathRewritten: boolean } {
   const content: any[] = [];
+  let pathRewritten = false;
 
   if (openaiRes.output) {
     for (const item of openaiRes.output) {
@@ -272,27 +279,36 @@ export function translateResponse(openaiRes: any, mapping?: WorktreeMapping | nu
         }
       } else if (item.type === "function_call") {
         const input = safeJsonParse(item.arguments);
+        let finalInput = input;
+        if (mapping) {
+          const { result, rewritten } = rewriteInputPaths(input, mapping);
+          finalInput = result;
+          if (rewritten) pathRewritten = true;
+        }
         content.push({
           type: "tool_use",
           id: toToolUseId(item.call_id || item.id),
           name: item.name,
-          input: mapping ? rewriteInputPaths(input, mapping) : input,
+          input: finalInput,
         });
       }
     }
   }
 
   return {
-    id: `msg_${openaiRes.id || "unknown"}`,
-    type: "message",
-    role: "assistant",
-    model: openaiRes.model,
-    content,
-    stop_reason: mapStopReason(openaiRes.status),
-    usage: {
-      input_tokens: openaiRes.usage?.input_tokens || 0,
-      output_tokens: openaiRes.usage?.output_tokens || 0,
+    response: {
+      id: `msg_${openaiRes.id || "unknown"}`,
+      type: "message",
+      role: "assistant",
+      model: openaiRes.model,
+      content,
+      stop_reason: mapStopReason(openaiRes.status),
+      usage: {
+        input_tokens: openaiRes.usage?.input_tokens || 0,
+        output_tokens: openaiRes.usage?.output_tokens || 0,
+      },
     },
+    pathRewritten,
   };
 }
 
@@ -507,7 +523,7 @@ function processEvent(
           // Rewrite paths in the complete arguments, then emit as a single delta
           const rawArgs = state.toolArgBuffer.get(outputIndex) ?? data.arguments ?? "";
           const parsed = safeJsonParse(rawArgs);
-          const rewritten = rewriteInputPaths(parsed, mapping);
+          const { result: rewritten } = rewriteInputPaths(parsed, mapping);
           const rewrittenJson = JSON.stringify(rewritten);
           writeEvent("content_block_delta", {
             type: "content_block_delta",

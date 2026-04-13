@@ -450,7 +450,7 @@ describe("translateResponse", () => {
       usage: { input_tokens: 10, output_tokens: 5 },
     };
 
-    const result = translateResponse(openaiRes);
+    const { response: result } = translateResponse(openaiRes);
 
     assert.equal(result.id, "msg_resp_001");
     assert.equal(result.type, "message");
@@ -477,7 +477,7 @@ describe("translateResponse", () => {
       usage: { input_tokens: 8, output_tokens: 12 },
     };
 
-    const result = translateResponse(openaiRes);
+    const { response: result } = translateResponse(openaiRes);
 
     assert.equal(result.content.length, 1);
     const block = result.content[0];
@@ -504,7 +504,7 @@ describe("translateResponse", () => {
       usage: { input_tokens: 1, output_tokens: 1 },
     };
 
-    const result = translateResponse(openaiRes);
+    const { response: result } = translateResponse(openaiRes);
     assert.equal(result.content[0].id, "toolu_xyz");
   });
 
@@ -524,13 +524,13 @@ describe("translateResponse", () => {
       usage: { input_tokens: 1, output_tokens: 1 },
     };
 
-    const result = translateResponse(openaiRes);
+    const { response: result } = translateResponse(openaiRes);
     assert.equal(result.content[0].id, "toolu_already");
   });
 
   // --- stop_reason mapping ---
   it('maps status "completed" → stop_reason "end_turn"', () => {
-    const result = translateResponse({
+    const { response: result } = translateResponse({
       id: "r",
       model: "m",
       status: "completed",
@@ -541,7 +541,7 @@ describe("translateResponse", () => {
   });
 
   it('maps status "incomplete" → stop_reason "max_tokens"', () => {
-    const result = translateResponse({
+    const { response: result } = translateResponse({
       id: "r",
       model: "m",
       status: "incomplete",
@@ -552,7 +552,7 @@ describe("translateResponse", () => {
   });
 
   it("maps unknown status → stop_reason end_turn (default)", () => {
-    const result = translateResponse({
+    const { response: result } = translateResponse({
       id: "r",
       model: "m",
       status: null,
@@ -564,7 +564,7 @@ describe("translateResponse", () => {
 
   // --- usage mapping ---
   it("maps usage fields correctly", () => {
-    const result = translateResponse({
+    const { response: result } = translateResponse({
       id: "r",
       model: "m",
       status: "completed",
@@ -576,7 +576,7 @@ describe("translateResponse", () => {
   });
 
   it("defaults usage tokens to 0 when missing", () => {
-    const result = translateResponse({
+    const { response: result } = translateResponse({
       id: "r",
       model: "m",
       status: "completed",
@@ -588,7 +588,7 @@ describe("translateResponse", () => {
   });
 
   it("handles malformed JSON arguments gracefully (returns empty object)", () => {
-    const result = translateResponse({
+    const { response: result } = translateResponse({
       id: "r",
       model: "m",
       status: "completed",
@@ -649,7 +649,7 @@ describe("ID conversion", () => {
   });
 
   it("toToolUseId: call_xxx → toolu_xxx (via translateResponse)", () => {
-    const result = translateResponse({
+    const { response: result } = translateResponse({
       id: "r",
       model: "m",
       status: "completed",
@@ -990,7 +990,7 @@ describe("translateResponse with worktree mapping", () => {
       usage: { input_tokens: 1, output_tokens: 1 },
     };
 
-    const result = translateResponse(openaiRes, MAPPING);
+    const { response: result } = translateResponse(openaiRes, MAPPING);
     const toolBlock = result.content.find((b: any) => b.type === "tool_use");
     assert.ok(toolBlock);
     assert.equal(toolBlock.input.file_path, "/Users/x/project/.claude/worktrees/agent-abc/src/foo.ts");
@@ -1014,7 +1014,7 @@ describe("translateResponse with worktree mapping", () => {
       usage: { input_tokens: 1, output_tokens: 1 },
     };
 
-    const result = translateResponse(openaiRes, MAPPING);
+    const { response: result } = translateResponse(openaiRes, MAPPING);
     const toolBlock = result.content.find((b: any) => b.type === "tool_use");
     assert.equal(toolBlock.input.file_path, "/other/path/file.ts");
   });
@@ -1035,7 +1035,7 @@ describe("translateResponse with worktree mapping", () => {
       usage: { input_tokens: 1, output_tokens: 1 },
     };
 
-    const result = translateResponse(openaiRes);
+    const { response: result } = translateResponse(openaiRes);
     const toolBlock = result.content.find((b: any) => b.type === "tool_use");
     assert.equal(toolBlock.input.file_path, "/Users/x/project/src/foo.ts");
   });

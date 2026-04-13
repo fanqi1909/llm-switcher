@@ -657,12 +657,13 @@ async function handleOpenAIProxy(
   const requestedModel = typeof requestBody.model === "string" ? requestBody.model : null;
   const effectiveModel = typeof requestBody.model === "string" ? requestBody.model : session.model_override || null;
 
-  function endResponse(status: number, body: any): void {
+  function endResponse(status: number, body: any, extraHeaders?: Record<string, string>): void {
     if (responseDone) return;
     responseDone = true;
     res.writeHead(status, {
       "content-type": "application/json",
       ...responseHeaders,
+      ...(extraHeaders || {}),
     });
     res.end(JSON.stringify(body));
   }
@@ -675,6 +676,7 @@ async function handleOpenAIProxy(
         "cache-control": "no-cache",
         "connection": "keep-alive",
         ...responseHeaders,
+        ...(worktreeMapping ? { "x-llm-path-rewritten": "true" } : {}),
       });
     }
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -732,8 +734,8 @@ async function handleOpenAIProxy(
           ...routingData,
           usage: event.response?.usage || null,
         });
-        const anthropicRes = translateResponse(event.response, worktreeMapping);
-        endResponse(200, anthropicRes);
+        const { response: anthropicRes, pathRewritten } = translateResponse(event.response, worktreeMapping);
+        endResponse(200, anthropicRes, pathRewritten ? { "x-llm-path-rewritten": "true" } : undefined);
         ws.close();
       }
     });
