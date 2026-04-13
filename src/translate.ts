@@ -1,6 +1,11 @@
 import { buildCodexHeaders } from "./codex.js";
 import type { Session } from "./config.js";
 
+export interface WorktreeMapping {
+  original: string;  // original repo root, e.g. /Users/x/project
+  worktree: string;  // active worktree path, e.g. /Users/x/project/.claude/worktrees/agent-abc
+}
+
 // --- Request Translation: Anthropic Messages → OpenAI Responses API ---
 
 export function translateRequest(
@@ -237,10 +242,32 @@ function translateToolChoice(choice: any): any {
   return "auto";
 }
 
+// --- Path rewriting for worktree sessions ---
+
+const PATH_FIELDS = ["file_path", "path"];
+
+function rewriteInputPaths(input: any, mapping: WorktreeMapping): { result: any; rewritten: boolean } {
+  if (!input || typeof input !== "object") return { result: input, rewritten: false };
+  const result = { ...input };
+  let rewritten = false;
+  for (const field of PATH_FIELDS) {
+    if (
+      typeof result[field] === "string" &&
+      result[field].startsWith(mapping.original + "/") &&
+      !result[field].startsWith(mapping.worktree + "/")
+    ) {
+      result[field] = mapping.worktree + result[field].slice(mapping.original.length);
+      rewritten = true;
+    }
+  }
+  return { result, rewritten };
+}
+
 // --- Non-Streaming Response Translation: OpenAI Responses → Anthropic ---
 
-export function translateResponse(openaiRes: any): any {
+export function translateResponse(openaiRes: any, mapping?: WorktreeMapping | null): { response: any; pathRewritten: boolean } {
   const content: any[] = [];
+  let pathRewritten = false;
 
   if (openaiRes.output) {
     for (const item of openaiRes.output) {
@@ -251,27 +278,37 @@ export function translateResponse(openaiRes: any): any {
           }
         }
       } else if (item.type === "function_call") {
+        const input = safeJsonParse(item.arguments);
+        let finalInput = input;
+        if (mapping) {
+          const { result, rewritten } = rewriteInputPaths(input, mapping);
+          finalInput = result;
+          if (rewritten) pathRewritten = true;
+        }
         content.push({
           type: "tool_use",
           id: toToolUseId(item.call_id || item.id),
           name: item.name,
-          input: safeJsonParse(item.arguments),
+          input: finalInput,
         });
       }
     }
   }
 
   return {
-    id: `msg_${openaiRes.id || "unknown"}`,
-    type: "message",
-    role: "assistant",
-    model: openaiRes.model,
-    content,
-    stop_reason: mapStopReason(openaiRes.status),
-    usage: {
-      input_tokens: openaiRes.usage?.input_tokens || 0,
-      output_tokens: openaiRes.usage?.output_tokens || 0,
+    response: {
+      id: `msg_${openaiRes.id || "unknown"}`,
+      type: "message",
+      role: "assistant",
+      model: openaiRes.model,
+      content,
+      stop_reason: mapStopReason(openaiRes.status),
+      usage: {
+        input_tokens: openaiRes.usage?.input_tokens || 0,
+        output_tokens: openaiRes.usage?.output_tokens || 0,
+      },
     },
+    pathRewritten,
   };
 }
 
@@ -309,6 +346,7 @@ interface StreamState {
   contentBlockIndex: number;
   textBlockOpen: boolean;
   toolBlockByOutputIndex: Map<number, { blockIdx: number; callId: string }>; // output_index → block info
+  toolArgBuffer: Map<number, string>; // output_index → accumulated arguments string (for path rewriting)
   inputTokens: number;
   outputTokens: number;
 }
@@ -319,8 +357,12 @@ interface StreamState {
  *
  * Returns a function: (event, writeEvent) => void
  * Call with each parsed WS message. Use { type: "_finish" } to emit message_stop.
+ *
+ * When mapping is provided, tool call file_path arguments are rewritten from
+ * the original repo root to the active worktree path before being emitted.
+ * Tool call arguments are buffered until complete so the rewrite can be applied.
  */
-export function createWsEventProcessor(): (
+export function createWsEventProcessor(mapping?: WorktreeMapping | null): (
   data: any,
   writeEvent: (event: string, data: any) => void,
 ) => void {
@@ -331,6 +373,7 @@ export function createWsEventProcessor(): (
     contentBlockIndex: 0,
     textBlockOpen: false,
     toolBlockByOutputIndex: new Map(),
+    toolArgBuffer: new Map(),
     inputTokens: 0,
     outputTokens: 0,
   };
@@ -340,7 +383,7 @@ export function createWsEventProcessor(): (
       finishStream(state, writeEvent);
       return;
     }
-    processEvent(data, state, writeEvent);
+    processEvent(data, state, writeEvent, mapping ?? null);
   };
 }
 
@@ -348,6 +391,7 @@ function processEvent(
   data: any,
   state: StreamState,
   writeEvent: (event: string, data: any) => void,
+  mapping: WorktreeMapping | null,
 ): void {
   const eventType = data.type;
 
@@ -457,11 +501,16 @@ function processEvent(
       const outputIndex = data.output_index ?? 0;
       const info = state.toolBlockByOutputIndex.get(outputIndex);
       if (info) {
-        writeEvent("content_block_delta", {
-          type: "content_block_delta",
-          index: info.blockIdx,
-          delta: { type: "input_json_delta", partial_json: data.delta },
-        });
+        if (mapping) {
+          // Buffer args for path rewriting on done; don't emit deltas yet
+          state.toolArgBuffer.set(outputIndex, (state.toolArgBuffer.get(outputIndex) ?? "") + (data.delta ?? ""));
+        } else {
+          writeEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: info.blockIdx,
+            delta: { type: "input_json_delta", partial_json: data.delta },
+          });
+        }
       }
       break;
     }
@@ -470,6 +519,19 @@ function processEvent(
       const outputIndex = data.output_index ?? 0;
       const info = state.toolBlockByOutputIndex.get(outputIndex);
       if (info) {
+        if (mapping) {
+          // Rewrite paths in the complete arguments, then emit as a single delta
+          const rawArgs = state.toolArgBuffer.get(outputIndex) ?? data.arguments ?? "";
+          const parsed = safeJsonParse(rawArgs);
+          const { result: rewritten } = rewriteInputPaths(parsed, mapping);
+          const rewrittenJson = JSON.stringify(rewritten);
+          writeEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: info.blockIdx,
+            delta: { type: "input_json_delta", partial_json: rewrittenJson },
+          });
+          state.toolArgBuffer.delete(outputIndex);
+        }
         writeEvent("content_block_stop", {
           type: "content_block_stop",
           index: info.blockIdx,

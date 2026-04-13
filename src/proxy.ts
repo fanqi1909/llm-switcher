@@ -2,7 +2,7 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { getActiveSession, listSessions, addSession, removeSession, setActive, updateSessionToken } from "./config.js";
 import type { Session } from "./config.js";
-import { buildCodexHeaders, refreshCodexToken, updateCodexAuthFile } from "./codex.js";
+import { buildCodexHeaders, refreshCodexToken, updateCodexAuthFile, loadCodexAuth } from "./codex.js";
 import { inferProviderFromModel, pickDeterministicSessionName } from "./models.js";
 import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
 
@@ -141,11 +141,64 @@ const sessionObservability: Record<string, SessionObservability> = {};
 const sessionProbeStatus: Record<string, SessionProbeStatus> = {};
 const pendingTokenRefresh = new Map<string, Promise<import("./codex.js").CodexTokenRefreshResult>>();
 
+interface CachedWorktreeMapping {
+  original: string;
+  worktree: string;
+  lastSeen: number;
+}
+const worktreeMappings = new Map<string, CachedWorktreeMapping>();
+const WORKTREE_MAPPING_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+const WORKTREE_SUFFIX_RE = /\/\.claude\/worktrees\/[^/]+$/;
+
+function detectWorktreeMapping(system: any): { original: string; worktree: string } | null {
+  let text: string;
+  if (typeof system === "string") {
+    text = system;
+  } else if (Array.isArray(system)) {
+    text = system
+      .filter((b: any) => b.type === "text")
+      .map((b: any) => b.text)
+      .join("\n");
+  } else {
+    return null;
+  }
+  const match = text.match(/Working directory:\s*(\S+)/);
+  if (!match) return null;
+  const worktree = match[1];
+  const original = worktree.replace(WORKTREE_SUFFIX_RE, "");
+  if (original === worktree) return null; // not a worktree path
+  return { original, worktree };
+}
+
+function getWorktreeMapping(chatSessionId: string | null, system: any): { original: string; worktree: string } | null {
+  if (!chatSessionId) return detectWorktreeMapping(system);
+
+  const now = Date.now();
+  // Purge stale entries
+  for (const [key, entry] of worktreeMappings) {
+    if (now - entry.lastSeen > WORKTREE_MAPPING_TTL_MS) worktreeMappings.delete(key);
+  }
+
+  const cached = worktreeMappings.get(chatSessionId);
+  if (cached) {
+    cached.lastSeen = now;
+    return { original: cached.original, worktree: cached.worktree };
+  }
+
+  const detected = detectWorktreeMapping(system);
+  if (detected) {
+    worktreeMappings.set(chatSessionId, { ...detected, lastSeen: now });
+  }
+  return detected;
+}
+
 export function resetRuntimeObservability(): void {
   for (const key of Object.keys(rateLimits)) delete rateLimits[key];
   for (const key of Object.keys(sessionObservability)) delete sessionObservability[key];
   for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
   pendingTokenRefresh.clear();
+  worktreeMappings.clear();
 }
 
 export function setProbeCheckedAtForTest(sessionName: string, checkedAt: string): void {
@@ -475,7 +528,7 @@ async function handleProxy(
   const routingData = getRoutingReasonData(resolution);
 
   if (session.provider === "openai") {
-    return handleOpenAIProxy(res, body, session, deps, routingHeaders, routingData);
+    return handleOpenAIProxy(res, body, session, deps, routingHeaders, routingData, chatSessionId);
   }
 
   const requestedModel = typeof body.model === "string" ? body.model : null;
@@ -586,6 +639,7 @@ async function handleOpenAIProxy(
   deps: Required<ProxyDeps>,
   responseHeaders: Record<string, string> = sessionUsedHeader(session.name),
   routingData: { resolvedSession?: string | null; inferredProvider?: Session["provider"] | null; resolutionReason?: RoutingReason | null } = {},
+  chatSessionId: string | null = null,
 ): Promise<void> {
   let translated;
   try {
@@ -596,17 +650,20 @@ async function handleOpenAIProxy(
     return;
   }
 
+  const worktreeMapping = getWorktreeMapping(chatSessionId, requestBody.system);
+
   const isStream = requestBody.stream === true;
   let responseDone = false;
   const requestedModel = typeof requestBody.model === "string" ? requestBody.model : null;
   const effectiveModel = typeof requestBody.model === "string" ? requestBody.model : session.model_override || null;
 
-  function endResponse(status: number, body: any): void {
+  function endResponse(status: number, body: any, extraHeaders?: Record<string, string>): void {
     if (responseDone) return;
     responseDone = true;
     res.writeHead(status, {
       "content-type": "application/json",
       ...responseHeaders,
+      ...(extraHeaders || {}),
     });
     res.end(JSON.stringify(body));
   }
@@ -619,6 +676,7 @@ async function handleOpenAIProxy(
         "cache-control": "no-cache",
         "connection": "keep-alive",
         ...responseHeaders,
+        ...(worktreeMapping ? { "x-llm-path-rewritten": "true" } : {}),
       });
     }
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -627,7 +685,7 @@ async function handleOpenAIProxy(
   function connectWs(token: string, canRetry: boolean): void {
     const headers = buildCodexHeaders(token, session.account_id || "");
     const ws = deps.openAIWsFactory(translated.url, { headers });
-    const processWsEvent = createWsEventProcessor();
+    const processWsEvent = createWsEventProcessor(worktreeMapping);
 
     ws.on("open", () => {
       ws.send(JSON.stringify({ type: "response.create", ...requestBody }));
@@ -676,8 +734,8 @@ async function handleOpenAIProxy(
           ...routingData,
           usage: event.response?.usage || null,
         });
-        const anthropicRes = translateResponse(event.response);
-        endResponse(200, anthropicRes);
+        const { response: anthropicRes, pathRewritten } = translateResponse(event.response, worktreeMapping);
+        endResponse(200, anthropicRes, pathRewritten ? { "x-llm-path-rewritten": "true" } : undefined);
         ws.close();
       }
     });
@@ -685,7 +743,9 @@ async function handleOpenAIProxy(
     ws.on("error", async (err) => {
       const is401 = (err as any).statusCode === 401 || err.message.includes("401");
       if (canRetry && is401) {
-        const refreshToken = session.refresh_token;
+        // Prefer refresh_token stored in session config; fall back to ~/.codex/auth.json
+        // so sessions created before refresh_token storage was added still auto-refresh.
+        const refreshToken = session.refresh_token ?? loadCodexAuth()?.tokens?.refresh_token ?? null;
         if (refreshToken) {
           console.error(`[OpenAI] Token expired, attempting refresh for session '${session.name}'`);
           try {
@@ -1059,6 +1119,16 @@ async function handleAdmin(
 
   if (req.method === "GET" && path === "/admin/recent-chat-id") {
     res.end(JSON.stringify({ chat_session_id: lastSeenChatSessionId }));
+    return;
+  }
+
+  if (req.method === "GET" && path === "/admin/path-map") {
+    const entries: Record<string, { original: string; worktree: string; last_seen_at: string }> = {};
+    for (const [chatId, m] of worktreeMappings) {
+      entries[chatId] = { original: m.original, worktree: m.worktree, last_seen_at: new Date(m.lastSeen).toISOString() };
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ path_mappings: entries }));
     return;
   }
 
