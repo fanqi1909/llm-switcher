@@ -2,7 +2,7 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { getActiveSession, listSessions, addSession, removeSession, setActive, updateSessionToken } from "./config.js";
 import type { Session } from "./config.js";
-import { buildCodexHeaders, refreshCodexToken, updateCodexAuthFile } from "./codex.js";
+import { buildCodexHeaders, refreshCodexToken, updateCodexAuthFile, loadCodexAuth } from "./codex.js";
 import { inferProviderFromModel, pickDeterministicSessionName } from "./models.js";
 import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
 
@@ -743,7 +743,9 @@ async function handleOpenAIProxy(
     ws.on("error", async (err) => {
       const is401 = (err as any).statusCode === 401 || err.message.includes("401");
       if (canRetry && is401) {
-        const refreshToken = session.refresh_token;
+        // Prefer refresh_token stored in session config; fall back to ~/.codex/auth.json
+        // so sessions created before refresh_token storage was added still auto-refresh.
+        const refreshToken = session.refresh_token ?? loadCodexAuth()?.tokens?.refresh_token ?? null;
         if (refreshToken) {
           console.error(`[OpenAI] Token expired, attempting refresh for session '${session.name}'`);
           try {
