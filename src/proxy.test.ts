@@ -43,12 +43,13 @@ async function request(baseUrl: string, path: string, init: RequestInit = {}) {
 beforeEach(() => {
   const dir = mkdtempSync(join(tmpdir(), "llm-switcher-proxy-test-"));
   tempDirs.push(dir);
-  process.chdir(dir);
+  process.env.LLM_SWITCHER_CONFIG_PATH = join(dir, "config.json");
   saveConfig({ active_session: null, sessions: {} });
   resetRuntimeObservability();
 });
 
 afterEach(() => {
+  delete process.env.LLM_SWITCHER_CONFIG_PATH;
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
