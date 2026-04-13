@@ -539,7 +539,7 @@ async function handleProxy(
     if (typeof v === "string") incomingHeaders[k] = v;
   }
 
-  if (session.model_override && !body.model) {
+  if (session.model_override) {
     body.model = session.model_override;
   }
 
@@ -652,10 +652,14 @@ async function handleOpenAIProxy(
 
   const worktreeMapping = getWorktreeMapping(chatSessionId, requestBody.system);
 
+  const translatedBody = JSON.parse(translated.body);
   const isStream = requestBody.stream === true;
   let responseDone = false;
   const requestedModel = typeof requestBody.model === "string" ? requestBody.model : null;
-  const effectiveModel = typeof requestBody.model === "string" ? requestBody.model : session.model_override || null;
+  const effectiveModel =
+    typeof translatedBody.model === "string"
+      ? translatedBody.model
+      : session.model_override || requestedModel;
 
   function endResponse(status: number, body: any, extraHeaders?: Record<string, string>): void {
     if (responseDone) return;
@@ -688,7 +692,7 @@ async function handleOpenAIProxy(
     const processWsEvent = createWsEventProcessor(worktreeMapping);
 
     ws.on("open", () => {
-      ws.send(JSON.stringify({ type: "response.create", ...requestBody }));
+      ws.send(JSON.stringify({ type: "response.create", ...translatedBody }));
     });
 
     ws.on("message", (data) => {
