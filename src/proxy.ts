@@ -432,7 +432,7 @@ function resolveHttpRouting(req: IncomingMessage, body: any, chatSessionId: stri
   }
 
   const modelResolution = resolveModelRoutedSession(body.model);
-  if (modelResolution.resolvedSessionName) {
+  if (modelResolution.reason === "model_override_exact" || modelResolution.reason === "session_name_alias") {
     return {
       requestedSession: modelResolution.resolvedSessionName,
       requestedModel: modelResolution.requestedModel,
@@ -454,12 +454,32 @@ function resolveHttpRouting(req: IncomingMessage, body: any, chatSessionId: stri
   }
 
   const active = getActiveSession();
+  if (active) {
+    return {
+      requestedSession: active.name,
+      requestedModel: modelResolution.requestedModel,
+      resolvedSessionName: active.name,
+      inferredProvider: modelResolution.inferredProvider,
+      reason: "active_session_fallback",
+    };
+  }
+
+  if (modelResolution.resolvedSessionName) {
+    return {
+      requestedSession: modelResolution.resolvedSessionName,
+      requestedModel: modelResolution.requestedModel,
+      resolvedSessionName: modelResolution.resolvedSessionName,
+      inferredProvider: modelResolution.inferredProvider,
+      reason: modelResolution.reason,
+    };
+  }
+
   return {
-    requestedSession: active?.name || null,
+    requestedSession: null,
     requestedModel: modelResolution.requestedModel,
-    resolvedSessionName: active?.name || null,
+    resolvedSessionName: null,
     inferredProvider: modelResolution.inferredProvider,
-    reason: active ? "active_session_fallback" : null,
+    reason: null,
   };
 }
 

@@ -65,10 +65,10 @@ Instead, phase 1 should route Claude Code requests using the only per-request di
 Recommended phase-1 behavior:
 
 1. keep explicit `x-llm-session` as the highest-priority override
-2. if no explicit session override exists, inspect `body.model`
-3. infer provider from built-in model/provider mapping when possible
-4. resolve a compatible session from the configured session pool
-5. if no model-based match exists, fall back to existing per-chat binding or global active session behavior
+2. if no explicit session override exists, inspect `body.model` for exact `model_override` or session-name matches
+3. if no exact model-based match exists, prefer the current global active session
+4. if there is no active session, fall back to existing per-chat binding
+5. only then infer provider from built-in model/provider mapping and resolve a compatible session from the configured session pool
 6. keep this deterministic and avoid health-based failover in the first step
 
 This is not true lane identity. It is a request-scoped routing step that approximates stable subagent routing when a subagent keeps the same model for its lifetime.

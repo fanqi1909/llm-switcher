@@ -439,7 +439,69 @@ describe("proxy HTTP routes", () => {
     });
   });
 
-  it("routes by provider_inference_match when request model implies anthropic provider", async () => {
+  it("prefers the active session over provider inference when both are available", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await once(upstreamServer.listen(0, "127.0.0.1"), "listening");
+    const addr = upstreamServer.address();
+    assert.ok(addr && typeof addr === "object");
+    const upstreamUrl = `ws://127.0.0.1:${addr.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_active",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [{ type: "message", content: [{ type: "output_text", text: "from active session" }] }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+      fetchImpl: async () => new Response(JSON.stringify({
+        id: "msg_active", type: "message", role: "assistant",
+        model: "claude-sonnet-4-5", content: [], usage: { input_tokens: 1, output_tokens: 1 },
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "codex-1", provider: "openai", token: "sk-openai-test", model_override: "gpt-5.4" }),
+        });
+
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "claude", provider: "anthropic", token: "sk-ant-test" }),
+        });
+
+        const res = await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "claude-sonnet-4-5", stream: false, messages: [{ role: "user", content: "hi" }] }),
+        });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("x-llm-session-used"), "codex-1");
+        assert.equal(res.headers.get("x-llm-routing-reason"), "active_session_fallback");
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it("routes by provider_inference_match when request model implies anthropic provider and no active session exists", async () => {
     const proxy = createProxyServer({
       fetchImpl: async () => new Response(JSON.stringify({
         id: "msg_3", type: "message", role: "assistant",
@@ -454,7 +516,16 @@ describe("proxy HTTP routes", () => {
         body: JSON.stringify({ name: "my-anthropic", provider: "anthropic", token: "sk-ant-test" }),
       });
 
-      // Request with a claude model that has no exact match — should infer anthropic and pick my-anthropic
+      saveConfig({
+        active_session: null,
+        sessions: {
+          "my-anthropic": {
+            provider: "anthropic",
+            token: "sk-ant-test",
+          },
+        },
+      });
+
       const res = await request(baseUrl, "/v1/messages", {
         method: "POST",
         headers: { "content-type": "application/json" },
