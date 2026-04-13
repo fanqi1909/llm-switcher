@@ -144,7 +144,7 @@ describe("proxy HTTP routes", () => {
 
       assert.equal(res.status, 200);
       assert.equal(res.headers.get("x-llm-session-used"), "claude-work");
-      assert.equal(res.headers.get("x-llm-routing-reason"), "provider_inference_match");
+      assert.equal(res.headers.get("x-llm-routing-reason"), "active_session_fallback");
       const body = JSON.parse(res.text);
       assert.equal(body.content[0].text, "hello");
       assert.equal(fetchCalls.length, 1);
