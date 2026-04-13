@@ -102,7 +102,7 @@ describe("proxy HTTP routes", () => {
     });
   });
 
-  it("proxies anthropic requests through fetch and applies model override", async () => {
+  it("proxies anthropic requests through fetch and forces model override", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     const proxy = createProxyServer({
       fetchImpl: async (url, init) => {
@@ -137,13 +137,14 @@ describe("proxy HTTP routes", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
+          model: "claude-opus-4-6",
           messages: [{ role: "user", content: "hello" }],
         }),
       });
 
       assert.equal(res.status, 200);
       assert.equal(res.headers.get("x-llm-session-used"), "claude-work");
-      assert.equal(res.headers.get("x-llm-routing-reason"), "active_session_fallback");
+      assert.equal(res.headers.get("x-llm-routing-reason"), "provider_inference_match");
       const body = JSON.parse(res.text);
       assert.equal(body.content[0].text, "hello");
       assert.equal(fetchCalls.length, 1);
@@ -556,7 +557,7 @@ describe("session probe TTL", () => {
 });
 
 describe("OpenAI proxy effectiveModel", () => {
-  it("records last_effective_model in observability after a successful OpenAI request", async () => {
+  it("sends the translated model upstream and records it in observability", async () => {
     const upstreamServer = createServer();
     const upstreamWss = new WebSocketServer({ server: upstreamServer });
 
@@ -565,8 +566,10 @@ describe("OpenAI proxy effectiveModel", () => {
     assert.ok(addr && typeof addr === "object");
     const upstreamUrl = `ws://127.0.0.1:${addr.port}`;
 
+    let upstreamRequest: any = null;
     upstreamWss.on("connection", (ws) => {
-      ws.on("message", () => {
+      ws.on("message", (data) => {
+        upstreamRequest = JSON.parse(data.toString());
         ws.send(JSON.stringify({
           type: "response.completed",
           response: {
@@ -595,9 +598,11 @@ describe("OpenAI proxy effectiveModel", () => {
         const res = await request(baseUrl, "/v1/messages", {
           method: "POST",
           headers: { "content-type": "application/json", "x-llm-session": "gpt-work" },
-          body: JSON.stringify({ stream: false, model: "gpt-5.4", messages: [{ role: "user", content: "hi" }] }),
+          body: JSON.stringify({ stream: false, model: "claude-opus-4-6", messages: [{ role: "user", content: "hi" }] }),
         });
         assert.equal(res.status, 200);
+        assert.equal(upstreamRequest?.type, "response.create");
+        assert.equal(upstreamRequest?.model, "gpt-5.4");
 
         const sessionsRes = await request(baseUrl, "/admin/sessions");
         const body = JSON.parse(sessionsRes.text);
