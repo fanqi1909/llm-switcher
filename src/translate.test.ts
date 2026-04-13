@@ -963,3 +963,127 @@ describe("createWsEventProcessor", () => {
     assert.equal(stops.length, 1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Worktree path rewriting
+// ---------------------------------------------------------------------------
+
+const MAPPING = {
+  original: "/Users/x/project",
+  worktree: "/Users/x/project/.claude/worktrees/agent-abc",
+};
+
+describe("translateResponse with worktree mapping", () => {
+  it("rewrites file_path in function_call tool_use input", () => {
+    const openaiRes = {
+      id: "r1",
+      model: "gpt-5.4",
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call_1",
+          name: "Edit",
+          arguments: JSON.stringify({ file_path: "/Users/x/project/src/foo.ts", old_string: "a", new_string: "b" }),
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+
+    const result = translateResponse(openaiRes, MAPPING);
+    const toolBlock = result.content.find((b: any) => b.type === "tool_use");
+    assert.ok(toolBlock);
+    assert.equal(toolBlock.input.file_path, "/Users/x/project/.claude/worktrees/agent-abc/src/foo.ts");
+    // Non-path fields untouched
+    assert.equal(toolBlock.input.old_string, "a");
+  });
+
+  it("leaves paths that do not start with original prefix unchanged", () => {
+    const openaiRes = {
+      id: "r2",
+      model: "gpt-5.4",
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call_2",
+          name: "Read",
+          arguments: JSON.stringify({ file_path: "/other/path/file.ts" }),
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+
+    const result = translateResponse(openaiRes, MAPPING);
+    const toolBlock = result.content.find((b: any) => b.type === "tool_use");
+    assert.equal(toolBlock.input.file_path, "/other/path/file.ts");
+  });
+
+  it("does not rewrite when no mapping is provided", () => {
+    const openaiRes = {
+      id: "r3",
+      model: "gpt-5.4",
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call_3",
+          name: "Read",
+          arguments: JSON.stringify({ file_path: "/Users/x/project/src/foo.ts" }),
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+
+    const result = translateResponse(openaiRes);
+    const toolBlock = result.content.find((b: any) => b.type === "tool_use");
+    assert.equal(toolBlock.input.file_path, "/Users/x/project/src/foo.ts");
+  });
+});
+
+describe("createWsEventProcessor with worktree mapping", () => {
+  it("buffers tool args and rewrites file_path on done", () => {
+    const processor = createWsEventProcessor(MAPPING);
+    const events = collectEvents(processor, [
+      { type: "response.created", response: { id: "r4", model: "gpt-5.4" } },
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", call_id: "call_4", name: "Edit" },
+      },
+      // Two deltas that together form the full JSON
+      { type: "response.function_call_arguments.delta", output_index: 0, delta: '{"file_path":"/Users/x/project/sr' },
+      { type: "response.function_call_arguments.delta", output_index: 0, delta: 'c/bar.ts"}' },
+      { type: "response.function_call_arguments.done", output_index: 0 },
+    ]);
+
+    // With mapping: deltas are buffered, so no delta events until done
+    const deltasBeforeDone = events.slice(0, events.findIndex((e) => e.event === "content_block_stop"));
+    const argDeltas = deltasBeforeDone.filter((e) => e.event === "content_block_delta" && e.data.delta.type === "input_json_delta");
+    // Should emit exactly one delta (the rewritten complete JSON) before content_block_stop
+    assert.equal(argDeltas.length, 1);
+    const emitted = JSON.parse(argDeltas[0].data.delta.partial_json);
+    assert.equal(emitted.file_path, "/Users/x/project/.claude/worktrees/agent-abc/src/bar.ts");
+  });
+
+  it("streams deltas normally when no mapping provided", () => {
+    const processor = createWsEventProcessor();
+    const events = collectEvents(processor, [
+      { type: "response.created", response: { id: "r5", model: "gpt-5.4" } },
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", call_id: "call_5", name: "Read" },
+      },
+      { type: "response.function_call_arguments.delta", output_index: 0, delta: '{"file_path"' },
+      { type: "response.function_call_arguments.delta", output_index: 0, delta: ':"x"}' },
+      { type: "response.function_call_arguments.done", output_index: 0 },
+    ]);
+
+    // Without mapping: deltas emitted immediately as they arrive
+    const argDeltas = events.filter((e) => e.event === "content_block_delta" && e.data.delta.type === "input_json_delta");
+    assert.equal(argDeltas.length, 2);
+    assert.equal(argDeltas[0].data.delta.partial_json, '{"file_path"');
+    assert.equal(argDeltas[1].data.delta.partial_json, ':"x"}');
+  });
+});

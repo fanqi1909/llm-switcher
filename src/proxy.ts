@@ -141,11 +141,64 @@ const sessionObservability: Record<string, SessionObservability> = {};
 const sessionProbeStatus: Record<string, SessionProbeStatus> = {};
 const pendingTokenRefresh = new Map<string, Promise<import("./codex.js").CodexTokenRefreshResult>>();
 
+interface CachedWorktreeMapping {
+  original: string;
+  worktree: string;
+  lastSeen: number;
+}
+const worktreeMappings = new Map<string, CachedWorktreeMapping>();
+const WORKTREE_MAPPING_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+const WORKTREE_SUFFIX_RE = /\/\.claude\/worktrees\/[^/]+$/;
+
+function detectWorktreeMapping(system: any): { original: string; worktree: string } | null {
+  let text: string;
+  if (typeof system === "string") {
+    text = system;
+  } else if (Array.isArray(system)) {
+    text = system
+      .filter((b: any) => b.type === "text")
+      .map((b: any) => b.text)
+      .join("\n");
+  } else {
+    return null;
+  }
+  const match = text.match(/Working directory:\s*(\S+)/);
+  if (!match) return null;
+  const worktree = match[1];
+  const original = worktree.replace(WORKTREE_SUFFIX_RE, "");
+  if (original === worktree) return null; // not a worktree path
+  return { original, worktree };
+}
+
+function getWorktreeMapping(chatSessionId: string | null, system: any): { original: string; worktree: string } | null {
+  if (!chatSessionId) return detectWorktreeMapping(system);
+
+  const now = Date.now();
+  // Purge stale entries
+  for (const [key, entry] of worktreeMappings) {
+    if (now - entry.lastSeen > WORKTREE_MAPPING_TTL_MS) worktreeMappings.delete(key);
+  }
+
+  const cached = worktreeMappings.get(chatSessionId);
+  if (cached) {
+    cached.lastSeen = now;
+    return { original: cached.original, worktree: cached.worktree };
+  }
+
+  const detected = detectWorktreeMapping(system);
+  if (detected) {
+    worktreeMappings.set(chatSessionId, { ...detected, lastSeen: now });
+  }
+  return detected;
+}
+
 export function resetRuntimeObservability(): void {
   for (const key of Object.keys(rateLimits)) delete rateLimits[key];
   for (const key of Object.keys(sessionObservability)) delete sessionObservability[key];
   for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
   pendingTokenRefresh.clear();
+  worktreeMappings.clear();
 }
 
 export function setProbeCheckedAtForTest(sessionName: string, checkedAt: string): void {
@@ -475,7 +528,7 @@ async function handleProxy(
   const routingData = getRoutingReasonData(resolution);
 
   if (session.provider === "openai") {
-    return handleOpenAIProxy(res, body, session, deps, routingHeaders, routingData);
+    return handleOpenAIProxy(res, body, session, deps, routingHeaders, routingData, chatSessionId);
   }
 
   const requestedModel = typeof body.model === "string" ? body.model : null;
@@ -586,6 +639,7 @@ async function handleOpenAIProxy(
   deps: Required<ProxyDeps>,
   responseHeaders: Record<string, string> = sessionUsedHeader(session.name),
   routingData: { resolvedSession?: string | null; inferredProvider?: Session["provider"] | null; resolutionReason?: RoutingReason | null } = {},
+  chatSessionId: string | null = null,
 ): Promise<void> {
   let translated;
   try {
@@ -595,6 +649,8 @@ async function handleOpenAIProxy(
     res.end(JSON.stringify({ error: { type: "invalid_request", message: (err as Error).message } }));
     return;
   }
+
+  const worktreeMapping = getWorktreeMapping(chatSessionId, requestBody.system);
 
   const isStream = requestBody.stream === true;
   let responseDone = false;
@@ -627,7 +683,7 @@ async function handleOpenAIProxy(
   function connectWs(token: string, canRetry: boolean): void {
     const headers = buildCodexHeaders(token, session.account_id || "");
     const ws = deps.openAIWsFactory(translated.url, { headers });
-    const processWsEvent = createWsEventProcessor();
+    const processWsEvent = createWsEventProcessor(worktreeMapping);
 
     ws.on("open", () => {
       ws.send(JSON.stringify({ type: "response.create", ...requestBody }));
@@ -676,7 +732,7 @@ async function handleOpenAIProxy(
           ...routingData,
           usage: event.response?.usage || null,
         });
-        const anthropicRes = translateResponse(event.response);
+        const anthropicRes = translateResponse(event.response, worktreeMapping);
         endResponse(200, anthropicRes);
         ws.close();
       }
@@ -1059,6 +1115,16 @@ async function handleAdmin(
 
   if (req.method === "GET" && path === "/admin/recent-chat-id") {
     res.end(JSON.stringify({ chat_session_id: lastSeenChatSessionId }));
+    return;
+  }
+
+  if (req.method === "GET" && path === "/admin/path-map") {
+    const entries: Record<string, { original: string; worktree: string; last_seen_at: string }> = {};
+    for (const [chatId, m] of worktreeMappings) {
+      entries[chatId] = { original: m.original, worktree: m.worktree, last_seen_at: new Date(m.lastSeen).toISOString() };
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ path_mappings: entries }));
     return;
   }
 

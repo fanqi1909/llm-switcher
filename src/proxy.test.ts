@@ -698,3 +698,86 @@ describe("OpenAI token auto-refresh on 401", () => {
     }
   });
 });
+
+describe("worktree path rewriting", () => {
+  it("rewrites file_path in non-streaming OpenAI tool_use response", async () => {
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await once(upstreamServer.listen(0, "127.0.0.1"), "listening");
+    const addr = upstreamServer.address();
+    assert.ok(addr && typeof addr === "object");
+    const upstreamUrl = `ws://127.0.0.1:${addr.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_wt",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [{
+              type: "function_call",
+              call_id: "call_wt",
+              name: "Edit",
+              arguments: JSON.stringify({ file_path: "/Users/x/project/src/foo.ts" }),
+            }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "gpt-wt", provider: "openai", token: "sk-test", model_override: "gpt-5.4" }),
+        });
+
+        const worktreePath = "/Users/x/project/.claude/worktrees/agent-abc";
+        const systemPrompt = `You are Claude Code.\nWorking directory: ${worktreePath}\nDo good work.`;
+
+        const res = await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-llm-session": "gpt-wt",
+            "x-claude-code-session-id": "chat-wt-001",
+          },
+          body: JSON.stringify({
+            stream: false,
+            model: "gpt-5.4",
+            system: systemPrompt,
+            messages: [{ role: "user", content: "edit the file" }],
+          }),
+        });
+
+        assert.equal(res.status, 200);
+        const body = JSON.parse(res.text);
+        const toolBlock = body.content.find((b: any) => b.type === "tool_use");
+        assert.ok(toolBlock, "should have a tool_use block");
+        assert.equal(
+          toolBlock.input.file_path,
+          `${worktreePath}/src/foo.ts`,
+          "file_path should be rewritten to worktree path",
+        );
+
+        // /admin/path-map should reflect the detected mapping
+        const mapRes = await request(baseUrl, "/admin/path-map");
+        const mapBody = JSON.parse(mapRes.text);
+        assert.ok(mapBody.path_mappings["chat-wt-001"]);
+        assert.equal(mapBody.path_mappings["chat-wt-001"].worktree, worktreePath);
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+});
