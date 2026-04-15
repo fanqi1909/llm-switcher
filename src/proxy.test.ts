@@ -858,3 +858,168 @@ describe("worktree path rewriting", () => {
     }
   });
 });
+
+describe("Anthropic OAuth token auto-refresh on 401", () => {
+  it("re-sniffs token and retries when upstream returns 401", async () => {
+    const expiredToken = "sk-ant-oat01-expired";
+    const freshToken = "sk-ant-oat01-fresh";
+    let sniffCalled = false;
+    let fetchCallCount = 0;
+
+    const proxy = createProxyServer({
+      fetchImpl: async (_url, init) => {
+        fetchCallCount++;
+        const authHeader = (init?.headers as Record<string, string>)?.authorization ?? "";
+        if (authHeader.includes(expiredToken)) {
+          return new Response(JSON.stringify({ error: { type: "authentication_error", message: "invalid token" } }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ id: "msg_ok", type: "message", role: "assistant", content: [], model: "claude-opus-4-5", stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 5 } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      sniffOAuthTokenImpl: async (_timeout) => {
+        sniffCalled = true;
+        return freshToken;
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "ant-oauth", provider: "anthropic", token: expiredToken }),
+      });
+
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      assert.equal(res.status, 200);
+      assert.ok(sniffCalled, "sniffOAuthToken should have been called");
+      assert.equal(fetchCallCount, 2, "should have made exactly 2 fetch calls (401 + retry)");
+      const body = JSON.parse(res.text);
+      assert.equal(body.id, "msg_ok");
+    });
+  });
+
+  it("returns 502 when re-sniff fails", async () => {
+    const proxy = createProxyServer({
+      fetchImpl: async () => {
+        return new Response(JSON.stringify({ error: { type: "authentication_error", message: "invalid token" } }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      sniffOAuthTokenImpl: async (_timeout) => {
+        throw new Error("claude CLI not found");
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "ant-oauth-fail", provider: "anthropic", token: "sk-ant-oat01-broken" }),
+      });
+
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      assert.equal(res.status, 502);
+      const body = JSON.parse(res.text);
+      assert.equal(body.error.type, "oauth_token_refresh_failed");
+    });
+  });
+
+  it("does not re-sniff for non-OAuth API key 401", async () => {
+    let sniffCalled = false;
+
+    const proxy = createProxyServer({
+      fetchImpl: async () => {
+        return new Response(JSON.stringify({ error: { type: "authentication_error", message: "invalid api key" } }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      sniffOAuthTokenImpl: async (_timeout) => {
+        sniffCalled = true;
+        return "should-not-be-called";
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "ant-apikey", provider: "anthropic", token: "sk-ant-api03-not-oauth" }),
+      });
+
+      const res = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      assert.equal(res.status, 401, "non-OAuth 401 should be passed through");
+      assert.ok(!sniffCalled, "sniffOAuthToken should NOT be called for non-OAuth tokens");
+    });
+  });
+
+  it("deduplicates concurrent re-sniff calls with shared mutex", async () => {
+    const expiredToken = "sk-ant-oat01-old-token-xyz";
+    const freshToken = "sk-ant-oat01-new-token-abc";
+    let sniffCallCount = 0;
+
+    const proxy = createProxyServer({
+      fetchImpl: async (_url, init) => {
+        const authHeader = (init?.headers as Record<string, string>)?.authorization ?? "";
+        if (authHeader.includes(expiredToken)) {
+          return new Response(JSON.stringify({ error: { type: "authentication_error" } }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ id: "msg_concurrent", type: "message", role: "assistant", content: [], model: "claude-opus-4-5", stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      sniffOAuthTokenImpl: async (_timeout) => {
+        sniffCallCount++;
+        await new Promise((r) => setTimeout(r, 20));
+        return freshToken;
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "ant-concurrent", provider: "anthropic", token: expiredToken }),
+      });
+
+      const requestBody = JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] });
+      const headers = { "content-type": "application/json" };
+
+      const [r1, r2, r3] = await Promise.all([
+        request(baseUrl, "/v1/messages", { method: "POST", headers, body: requestBody }),
+        request(baseUrl, "/v1/messages", { method: "POST", headers, body: requestBody }),
+        request(baseUrl, "/v1/messages", { method: "POST", headers, body: requestBody }),
+      ]);
+
+      assert.equal(r1.status, 200);
+      assert.equal(r2.status, 200);
+      assert.equal(r3.status, 200);
+      assert.equal(sniffCallCount, 1, "sniffOAuthToken should only be called once despite concurrent 401s");
+    });
+  });
+});
