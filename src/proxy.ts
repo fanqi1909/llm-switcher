@@ -3,6 +3,7 @@ import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { getActiveSession, listSessions, addSession, removeSession, setActive, updateSessionToken } from "./config.js";
 import type { Session } from "./config.js";
 import { buildCodexHeaders, refreshCodexToken, updateCodexAuthFile, loadCodexAuth } from "./codex.js";
+import { sniffOAuthToken } from "./login.js";
 import { inferProviderFromModel, pickDeterministicSessionName } from "./models.js";
 import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
 
@@ -14,6 +15,7 @@ interface ProxyDeps {
   openAIWsFactory?: WsFactory;
   codexBridgeWsFactory?: WsFactory;
   codexBridgeUrl?: string;
+  sniffOAuthTokenImpl?: (timeout?: number) => Promise<string | null>;
 }
 
 type RoutingReason =
@@ -140,6 +142,7 @@ interface SessionProbeStatus {
 const sessionObservability: Record<string, SessionObservability> = {};
 const sessionProbeStatus: Record<string, SessionProbeStatus> = {};
 const pendingTokenRefresh = new Map<string, Promise<import("./codex.js").CodexTokenRefreshResult>>();
+const pendingAnthropicRefresh = new Map<string, Promise<string | null>>();
 
 interface CachedWorktreeMapping {
   original: string;
@@ -198,6 +201,7 @@ export function resetRuntimeObservability(): void {
   for (const key of Object.keys(sessionObservability)) delete sessionObservability[key];
   for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
   pendingTokenRefresh.clear();
+  pendingAnthropicRefresh.clear();
   worktreeMappings.clear();
 }
 
@@ -566,18 +570,64 @@ async function handleProxy(
   body = injectBillingHeader({ ...body }, token);
 
   const upstreamUrl = getUpstreamUrl(baseUrl);
-  const upstreamHeaders = buildUpstreamHeaders(token, incomingHeaders);
   const isStream = body.stream === true;
+  const effectiveModel = typeof body.model === "string" ? body.model : session.model_override || null;
 
-  try {
-    const effectiveModel = typeof body.model === "string" ? body.model : session.model_override || null;
-    const upstreamRes = await deps.fetchImpl(upstreamUrl, {
-      method: "POST",
-      headers: upstreamHeaders,
-      body: JSON.stringify(body),
-    });
+  async function doAnthropicFetch(currentToken: string, canRetry: boolean): Promise<void> {
+    const upstreamHeaders = buildUpstreamHeaders(currentToken, incomingHeaders);
+    let upstreamRes: Response;
+    try {
+      upstreamRes = await deps.fetchImpl(upstreamUrl, {
+        method: "POST",
+        headers: upstreamHeaders,
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      recordSessionError(session, {
+        requestedModel,
+        effectiveModel,
+        ...routingData,
+        type: "upstream_connection_error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+      res.writeHead(502, { "content-type": "application/json", ...routingHeaders });
+      res.end(JSON.stringify({ error: { type: "upstream_connection_error", message: err instanceof Error ? err.message : String(err) } }));
+      return;
+    }
 
     updateRateLimits(session.name, upstreamRes.headers);
+
+    // Auto-refresh OAuth token on 401 and retry once
+    if (upstreamRes.status === 401 && isOAuthToken(currentToken) && canRetry) {
+      console.error(`[Anthropic] Token expired (401), attempting re-sniff for session '${session.name}'`);
+      try {
+        let refreshPromise = pendingAnthropicRefresh.get(session.name);
+        if (!refreshPromise) {
+          refreshPromise = deps.sniffOAuthTokenImpl(15000).finally(() => {
+            pendingAnthropicRefresh.delete(session.name);
+          });
+          pendingAnthropicRefresh.set(session.name, refreshPromise);
+        }
+        const newToken = await refreshPromise;
+        if (!newToken) throw new Error("sniffOAuthToken returned null — claude CLI unavailable or not logged in");
+        updateSessionToken(session.name, newToken);
+        session.token = newToken;
+        // Re-inject billing header with the new token before retrying
+        body = injectBillingHeader({ ...body }, newToken);
+        console.error(`[Anthropic] Token refreshed, retrying`);
+        return doAnthropicFetch(newToken, false);
+      } catch (refreshErr) {
+        console.error(`[Anthropic] Token refresh failed:`, (refreshErr as Error).message);
+        res.writeHead(502, { "content-type": "application/json", ...routingHeaders });
+        res.end(JSON.stringify({
+          error: {
+            type: "oauth_token_refresh_failed",
+            message: `Auto-refresh failed: ${(refreshErr as Error).message}. Run 'llm-switcher login' to manually refresh.`,
+          },
+        }));
+        return;
+      }
+    }
 
     if (isStream && upstreamRes.ok && upstreamRes.body) {
       recordSessionSuccess(session, {
@@ -637,19 +687,9 @@ async function handleProxy(
         });
       }
     }
-  } catch (err) {
-    const effectiveModel = typeof body.model === "string" ? body.model : session.model_override || null;
-    recordSessionError(session, {
-      requestedModel,
-      effectiveModel,
-      ...routingData,
-      type: "upstream_connection_error",
-      message: err instanceof Error ? err.message : String(err),
-    });
-    res.writeHead(502, { "content-type": "application/json", ...routingHeaders });
-    res.end(JSON.stringify({ error: { type: "upstream_connection_error", message: err instanceof Error ? err.message : String(err) } }));
-    return;
   }
+
+  return doAnthropicFetch(token, true);
 }
 
 async function handleOpenAIProxy(
@@ -1271,6 +1311,7 @@ export function createProxyServer(customDeps: ProxyDeps = {}) {
     openAIWsFactory: customDeps.openAIWsFactory || ((url, options) => new WsWebSocket(url, options)),
     codexBridgeWsFactory: customDeps.codexBridgeWsFactory || ((url, options) => new WsWebSocket(url, options)),
     codexBridgeUrl: customDeps.codexBridgeUrl || "wss://chatgpt.com/backend-api/codex/responses",
+    sniffOAuthTokenImpl: customDeps.sniffOAuthTokenImpl || sniffOAuthToken,
   };
 
   const server = createServer(async (req, res) => {
