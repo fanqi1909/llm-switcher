@@ -243,6 +243,7 @@ export function resetRuntimeObservability(): void {
   for (const key of Object.keys(rateLimits)) delete rateLimits[key];
   for (const key of Object.keys(sessionObservability)) delete sessionObservability[key];
   for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
+  for (const key of Object.keys(chatSessionMap)) delete chatSessionMap[key];
   pendingTokenRefresh.clear();
   pendingAnthropicRefresh.clear();
   worktreeMappings.clear();
@@ -490,6 +491,20 @@ function resolveHttpRouting(req: IncomingMessage, body: any, chatSessionId: stri
     };
   }
 
+  // chat_binding_fallback takes priority over model-based routing so that
+  // switching sessions mid-chat (via /admin/chat-bind) is respected even when
+  // the request body carries a model that would otherwise match a different session.
+  const chatBoundSession = chatSessionId ? chatSessionMap[chatSessionId] : undefined;
+  if (chatBoundSession) {
+    return {
+      requestedSession: chatBoundSession,
+      requestedModel: typeof body.model === "string" && body.model.trim() ? body.model.trim() : null,
+      resolvedSessionName: chatBoundSession,
+      inferredProvider: null,
+      reason: "chat_binding_fallback",
+    };
+  }
+
   const modelResolution = resolveModelRoutedSession(body.model);
   if (modelResolution.reason === "model_override_exact" || modelResolution.reason === "session_name_alias") {
     return {
@@ -498,17 +513,6 @@ function resolveHttpRouting(req: IncomingMessage, body: any, chatSessionId: stri
       resolvedSessionName: modelResolution.resolvedSessionName,
       inferredProvider: modelResolution.inferredProvider,
       reason: modelResolution.reason,
-    };
-  }
-
-  const chatBoundSession = chatSessionId ? chatSessionMap[chatSessionId] : undefined;
-  if (chatBoundSession) {
-    return {
-      requestedSession: chatBoundSession,
-      requestedModel: modelResolution.requestedModel,
-      resolvedSessionName: chatBoundSession,
-      inferredProvider: modelResolution.inferredProvider,
-      reason: "chat_binding_fallback",
     };
   }
 
