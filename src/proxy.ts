@@ -1,4 +1,5 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { getActiveSession, listSessions, addSession, removeSession, setActive, updateSessionToken } from "./config.js";
 import type { Session } from "./config.js";
@@ -33,6 +34,46 @@ interface RoutingResolution {
   resolvedSessionName: string | null;
   inferredProvider: Session["provider"] | null;
   reason: RoutingReason | null;
+}
+
+/** Immutable per-request context built once after routing resolution.
+ *  Carries every piece of routing/tracing data so it doesn't have to be
+ *  threaded as separate parameters through every helper. */
+interface RequestContext {
+  /** UUID for end-to-end request tracing (returned as x-llm-request-id). */
+  readonly requestId: string;
+  readonly chatSessionId: string | null;
+  readonly sessionName: string;
+  readonly routingReason: RoutingReason | null;
+  readonly requestedModel: string | null;
+  readonly resolvedSession: string | null;
+  readonly inferredProvider: Session["provider"] | null;
+  readonly startedAt: number;
+}
+
+function buildRequestContext(
+  chatSessionId: string | null,
+  session: { name: string },
+  resolution: RoutingResolution,
+): RequestContext {
+  return {
+    requestId: randomUUID(),
+    chatSessionId,
+    sessionName: session.name,
+    routingReason: resolution.reason,
+    requestedModel: resolution.requestedModel,
+    resolvedSession: resolution.resolvedSessionName,
+    inferredProvider: resolution.inferredProvider,
+    startedAt: Date.now(),
+  };
+}
+
+function buildResponseHeaders(ctx: RequestContext): Record<string, string> {
+  return {
+    "x-llm-session-used": ctx.sessionName,
+    "x-llm-request-id": ctx.requestId,
+    ...(ctx.routingReason ? { "x-llm-routing-reason": ctx.routingReason } : {}),
+  };
 }
 
 function sessionUsedHeader(sessionName: string, reason?: RoutingReason | null): Record<string, string> {
@@ -548,14 +589,15 @@ async function handleProxy(
     return;
   }
 
-  const routingHeaders = sessionUsedHeader(session.name, resolution.reason);
+  const ctx = buildRequestContext(chatSessionId, session, resolution);
+  const routingHeaders = buildResponseHeaders(ctx);
   const routingData = getRoutingReasonData(resolution);
 
   if (session.provider === "openai") {
-    return handleOpenAIProxy(res, body, session, deps, routingHeaders, routingData, chatSessionId);
+    return handleOpenAIProxy(res, body, session, deps, ctx, routingData);
   }
 
-  const requestedModel = typeof body.model === "string" ? body.model : null;
+  const requestedModel = ctx.requestedModel;
   const token = session.token;
   const baseUrl = session.base_url || "https://api.anthropic.com";
   const incomingHeaders: Record<string, string> = {};
@@ -697,10 +739,10 @@ async function handleOpenAIProxy(
   requestBody: any,
   session: { name: string; token: string; model_override?: string; account_id?: string; refresh_token?: string },
   deps: Required<ProxyDeps>,
-  responseHeaders: Record<string, string> = sessionUsedHeader(session.name),
+  ctx: RequestContext,
   routingData: { resolvedSession?: string | null; inferredProvider?: Session["provider"] | null; resolutionReason?: RoutingReason | null } = {},
-  chatSessionId: string | null = null,
 ): Promise<void> {
+  const responseHeaders = buildResponseHeaders(ctx);
   let translated;
   try {
     translated = translateRequest(requestBody, session);
@@ -710,7 +752,7 @@ async function handleOpenAIProxy(
     return;
   }
 
-  const worktreeMapping = getWorktreeMapping(chatSessionId, requestBody.system);
+  const worktreeMapping = getWorktreeMapping(ctx.chatSessionId, requestBody.system);
 
   const translatedBody = JSON.parse(translated.body);
   const isStream = requestBody.stream === true;

@@ -153,6 +153,40 @@ describe("proxy HTTP routes", () => {
     });
   });
 
+  it("includes x-llm-request-id in every response", async () => {
+    const proxy = createProxyServer({
+      fetchImpl: async () => new Response(JSON.stringify({ id: "msg_1", type: "message", role: "assistant", content: [], model: "claude-opus-4-5", stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }),
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "s1", provider: "anthropic", token: "sk-ant-test" }),
+      });
+
+      const r1 = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+      const r2 = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      const id1 = r1.headers.get("x-llm-request-id");
+      const id2 = r2.headers.get("x-llm-request-id");
+      assert.ok(id1, "x-llm-request-id should be present");
+      assert.ok(id2, "x-llm-request-id should be present");
+      assert.match(id1!, /^[0-9a-f-]{36}$/, "request-id should be a UUID");
+      assert.notEqual(id1, id2, "each request should get a unique id");
+    });
+  });
+
   it("uses the lean OAuth header set and billing block for anthropic OAuth sessions", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     const proxy = createProxyServer({
