@@ -44,7 +44,7 @@ program
       process.exit(1);
     }
     console.log(`Token captured: ${token.slice(0, 20)}...${token.slice(-10)}`);
-    addSession(name, "anthropic", token);
+    await addSession(name, "anthropic", token);
     console.log(`\u2713 Session '${name}' ready with fresh OAuth token`);
 
     if (process.env.ANTHROPIC_API_KEY) {
@@ -72,7 +72,7 @@ program
     console.log(`Account ID: ${accountId}`);
 
     const refreshToken = auth.tokens.refresh_token;
-    addSession(name, "openai", token, undefined, undefined, accountId, refreshToken);
+    await addSession(name, "openai", token, undefined, undefined, accountId, refreshToken);
     console.log(`\u2713 Session '${name}' ready with Codex OAuth token${refreshToken ? " (auto-refresh enabled)" : ""}`);
   });
 
@@ -93,8 +93,8 @@ program
     tryHttp("POST", "/admin/sessions", {
       name, provider: opts.provider, token: opts.token,
       base_url: opts.baseUrl, model_override: opts.model,
-    }).then((ok) => {
-      if (!ok) addSession(name, opts.provider, opts.token, opts.baseUrl, opts.model);
+    }).then(async (ok) => {
+      if (!ok) await addSession(name, opts.provider, opts.token, opts.baseUrl, opts.model);
       console.log(`\u2713 Added session '${name}' (${opts.provider})`);
     });
   });
@@ -105,7 +105,7 @@ program
   .description("Remove an LLM session")
   .action(async (name) => {
     const ok = await tryHttp("DELETE", `/admin/sessions/${name}`);
-    if (!ok) removeSession(name);
+    if (!ok) await removeSession(name);
     console.log(`\u2713 Removed session '${name}'`);
   });
 
@@ -239,9 +239,9 @@ program
 program
   .command("set-model <name> <model>")
   .description("Set the configured model for a session")
-  .action((name, model) => {
+  .action(async (name, model) => {
     try {
-      setSessionModel(name, model);
+      await setSessionModel(name, model);
     } catch (e: any) {
       console.error(`Error: ${e.message}`);
       process.exit(1);
@@ -256,7 +256,7 @@ program
   .action(async (name) => {
     const ok = await tryHttp("POST", `/admin/switch/${name}`);
     if (!ok) {
-      try { setActive(name); } catch (e: any) {
+      try { await setActive(name); } catch (e: any) {
         console.error(`Error: ${e.message}`);
         process.exit(1);
       }

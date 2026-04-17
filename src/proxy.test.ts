@@ -153,6 +153,40 @@ describe("proxy HTTP routes", () => {
     });
   });
 
+  it("includes x-llm-request-id in every response", async () => {
+    const proxy = createProxyServer({
+      fetchImpl: async () => new Response(JSON.stringify({ id: "msg_1", type: "message", role: "assistant", content: [], model: "claude-opus-4-5", stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }),
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "s1", provider: "anthropic", token: "sk-ant-test" }),
+      });
+
+      const r1 = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+      const r2 = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      const id1 = r1.headers.get("x-llm-request-id");
+      const id2 = r2.headers.get("x-llm-request-id");
+      assert.ok(id1, "x-llm-request-id should be present");
+      assert.ok(id2, "x-llm-request-id should be present");
+      assert.match(id1!, /^[0-9a-f-]{36}$/, "request-id should be a UUID");
+      assert.notEqual(id1, id2, "each request should get a unique id");
+    });
+  });
+
   it("uses the lean OAuth header set and billing block for anthropic OAuth sessions", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
     const proxy = createProxyServer({
@@ -851,6 +885,92 @@ describe("worktree path rewriting", () => {
         const mapBody = JSON.parse(mapRes.text);
         assert.ok(mapBody.path_mappings["chat-wt-001"]);
         assert.equal(mapBody.path_mappings["chat-wt-001"].worktree, worktreePath);
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+});
+
+describe("admin session bindings", () => {
+  it("GET /admin/sessions includes chat_session_bindings", async () => {
+    await withServer(async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "s", provider: "anthropic", token: "sk-ant-test" }),
+      });
+
+      // Bind a chat session
+      await request(baseUrl, "/admin/chat-bind/chat-abc/s", { method: "POST" });
+
+      const res = await request(baseUrl, "/admin/sessions");
+      const body = JSON.parse(res.text);
+      assert.ok(body.chat_session_bindings, "should include chat_session_bindings");
+      assert.equal(body.chat_session_bindings["chat-abc"], "s");
+    });
+  });
+});
+
+describe("failure semantics — translation_error", () => {
+  it("returns 502 translation_error when OpenAI response has malformed tool call JSON", async () => {
+    const { once: onceEv, EventEmitter } = await import("node:events");
+
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await onceEv(upstreamServer.listen(0, "127.0.0.1"), "listening");
+    const addr = upstreamServer.address();
+    assert.ok(addr && typeof addr === "object");
+    const upstreamUrl = `ws://127.0.0.1:${addr.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_bad",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [{
+              type: "function_call",
+              call_id: "call_x",
+              name: "Edit",
+              arguments: "NOT VALID JSON {{{{",
+            }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "gpt-bad", provider: "openai", token: "sk-test", model_override: "gpt-5.4" }),
+        });
+
+        const res = await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            stream: false,
+            model: "gpt-5.4",
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        });
+
+        assert.equal(res.status, 502);
+        const body = JSON.parse(res.text);
+        assert.equal(body.error.type, "translation_error");
+        assert.match(body.error.message, /Invalid JSON in tool call arguments/);
       });
     } finally {
       await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));

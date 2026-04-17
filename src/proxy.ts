@@ -1,11 +1,12 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { getActiveSession, listSessions, addSession, removeSession, setActive, updateSessionToken } from "./config.js";
 import type { Session } from "./config.js";
 import { buildCodexHeaders, refreshCodexToken, updateCodexAuthFile, loadCodexAuth } from "./codex.js";
 import { sniffOAuthToken } from "./login.js";
 import { inferProviderFromModel, pickDeterministicSessionName } from "./models.js";
-import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
+import { translateRequest, translateResponse, createWsEventProcessor, TranslationError } from "./translate.js";
 
 type FetchImpl = typeof fetch;
 type WsFactory = (url: string, options?: { headers?: Record<string, string> }) => WsWebSocket;
@@ -33,6 +34,46 @@ interface RoutingResolution {
   resolvedSessionName: string | null;
   inferredProvider: Session["provider"] | null;
   reason: RoutingReason | null;
+}
+
+/** Immutable per-request context built once after routing resolution.
+ *  Carries every piece of routing/tracing data so it doesn't have to be
+ *  threaded as separate parameters through every helper. */
+interface RequestContext {
+  /** UUID for end-to-end request tracing (returned as x-llm-request-id). */
+  readonly requestId: string;
+  readonly chatSessionId: string | null;
+  readonly sessionName: string;
+  readonly routingReason: RoutingReason | null;
+  readonly requestedModel: string | null;
+  readonly resolvedSession: string | null;
+  readonly inferredProvider: Session["provider"] | null;
+  readonly startedAt: number;
+}
+
+function buildRequestContext(
+  chatSessionId: string | null,
+  session: { name: string },
+  resolution: RoutingResolution,
+): RequestContext {
+  return {
+    requestId: randomUUID(),
+    chatSessionId,
+    sessionName: session.name,
+    routingReason: resolution.reason,
+    requestedModel: resolution.requestedModel,
+    resolvedSession: resolution.resolvedSessionName,
+    inferredProvider: resolution.inferredProvider,
+    startedAt: Date.now(),
+  };
+}
+
+function buildResponseHeaders(ctx: RequestContext): Record<string, string> {
+  return {
+    "x-llm-session-used": ctx.sessionName,
+    "x-llm-request-id": ctx.requestId,
+    ...(ctx.routingReason ? { "x-llm-routing-reason": ctx.routingReason } : {}),
+  };
 }
 
 function sessionUsedHeader(sessionName: string, reason?: RoutingReason | null): Record<string, string> {
@@ -120,6 +161,8 @@ interface SessionObservability {
   last_used_at: string | null;
   last_error: { type: string; message: string; status?: number } | null;
   last_usage: SessionUsageSnapshot | null;
+  last_request_id: string | null;
+  last_chat_session_id: string | null;
   totals: {
     input_tokens: number;
     output_tokens: number;
@@ -223,6 +266,8 @@ function getSessionObservability(session: { name: string; model_override?: strin
       last_used_at: null,
       last_error: null,
       last_usage: null,
+      last_request_id: null,
+      last_chat_session_id: null,
       totals: {
         input_tokens: 0,
         output_tokens: 0,
@@ -258,6 +303,7 @@ function recordSessionSuccess(
     inferredProvider?: Session["provider"] | null;
     resolutionReason?: RoutingReason | null;
     usage?: { input_tokens?: number; output_tokens?: number } | null;
+    ctx?: RequestContext;
   },
 ): void {
   const snapshot = getSessionObservability(session);
@@ -268,6 +314,10 @@ function recordSessionSuccess(
   snapshot.last_resolution_reason = data.resolutionReason ?? snapshot.last_resolution_reason;
   snapshot.last_used_at = new Date().toISOString();
   snapshot.last_error = null;
+  if (data.ctx) {
+    snapshot.last_request_id = data.ctx.requestId;
+    snapshot.last_chat_session_id = data.ctx.chatSessionId;
+  }
   snapshot.totals.requests += 1;
 
   if (data.usage) {
@@ -290,6 +340,7 @@ function recordSessionError(
     type: string;
     message: string;
     status?: number;
+    ctx?: RequestContext;
   },
 ): void {
   const snapshot = getSessionObservability(session);
@@ -299,6 +350,10 @@ function recordSessionError(
   snapshot.last_inferred_provider = data.inferredProvider ?? snapshot.last_inferred_provider;
   snapshot.last_resolution_reason = data.resolutionReason ?? snapshot.last_resolution_reason;
   snapshot.last_used_at = new Date().toISOString();
+  if (data.ctx) {
+    snapshot.last_request_id = data.ctx.requestId;
+    snapshot.last_chat_session_id = data.ctx.chatSessionId;
+  }
   snapshot.last_error = {
     type: data.type,
     message: data.message,
@@ -548,14 +603,15 @@ async function handleProxy(
     return;
   }
 
-  const routingHeaders = sessionUsedHeader(session.name, resolution.reason);
+  const ctx = buildRequestContext(chatSessionId, session, resolution);
+  const routingHeaders = buildResponseHeaders(ctx);
   const routingData = getRoutingReasonData(resolution);
 
   if (session.provider === "openai") {
-    return handleOpenAIProxy(res, body, session, deps, routingHeaders, routingData, chatSessionId);
+    return handleOpenAIProxy(res, body, session, deps, ctx, routingData);
   }
 
-  const requestedModel = typeof body.model === "string" ? body.model : null;
+  const requestedModel = ctx.requestedModel;
   const token = session.token;
   const baseUrl = session.base_url || "https://api.anthropic.com";
   const incomingHeaders: Record<string, string> = {};
@@ -610,7 +666,7 @@ async function handleProxy(
         }
         const newToken = await refreshPromise;
         if (!newToken) throw new Error("sniffOAuthToken returned null — claude CLI unavailable or not logged in");
-        updateSessionToken(session.name, newToken);
+        await updateSessionToken(session.name, newToken);
         session.token = newToken;
         // Re-inject billing header with the new token before retrying
         body = injectBillingHeader({ ...body }, newToken);
@@ -634,6 +690,7 @@ async function handleProxy(
         requestedModel,
         effectiveModel,
         ...routingData,
+        ctx,
       });
       res.writeHead(upstreamRes.status, {
         "content-type": "text/event-stream",
@@ -669,6 +726,7 @@ async function handleProxy(
           effectiveModel,
           ...routingData,
           usage: parsed?.usage || null,
+          ctx,
         });
       } else {
         let parsed: any = null;
@@ -684,6 +742,7 @@ async function handleProxy(
           type: parsed?.error?.type || "upstream_error",
           message: parsed?.error?.message || `Upstream error ${upstreamRes.status}`,
           status: upstreamRes.status,
+          ctx,
         });
       }
     }
@@ -697,10 +756,10 @@ async function handleOpenAIProxy(
   requestBody: any,
   session: { name: string; token: string; model_override?: string; account_id?: string; refresh_token?: string },
   deps: Required<ProxyDeps>,
-  responseHeaders: Record<string, string> = sessionUsedHeader(session.name),
+  ctx: RequestContext,
   routingData: { resolvedSession?: string | null; inferredProvider?: Session["provider"] | null; resolutionReason?: RoutingReason | null } = {},
-  chatSessionId: string | null = null,
 ): Promise<void> {
+  const responseHeaders = buildResponseHeaders(ctx);
   let translated;
   try {
     translated = translateRequest(requestBody, session);
@@ -710,7 +769,7 @@ async function handleOpenAIProxy(
     return;
   }
 
-  const worktreeMapping = getWorktreeMapping(chatSessionId, requestBody.system);
+  const worktreeMapping = getWorktreeMapping(ctx.chatSessionId, requestBody.system);
 
   const translatedBody = JSON.parse(translated.body);
   const isStream = requestBody.stream === true;
@@ -792,13 +851,34 @@ async function handleOpenAIProxy(
           ws.close();
         }
       } else if (event.type === "response.completed") {
+        let anthropicRes: any;
+        let pathRewritten = false;
+        try {
+          ({ response: anthropicRes, pathRewritten } = translateResponse(event.response, worktreeMapping));
+        } catch (translateErr) {
+          const msg = translateErr instanceof TranslationError
+            ? translateErr.message
+            : `Unexpected translation error: ${(translateErr as Error).message}`;
+          console.error(`[OpenAI] ${msg}`);
+          recordSessionError(session, {
+            requestedModel,
+            effectiveModel,
+            ...routingData,
+            type: "translation_error",
+            message: msg,
+            ctx,
+          });
+          endResponse(502, { error: { type: "translation_error", message: msg } });
+          ws.close();
+          return;
+        }
         recordSessionSuccess(session, {
           requestedModel,
           effectiveModel,
           ...routingData,
           usage: event.response?.usage || null,
+          ctx,
         });
-        const { response: anthropicRes, pathRewritten } = translateResponse(event.response, worktreeMapping);
         endResponse(200, anthropicRes, pathRewritten ? { "x-llm-path-rewritten": "true" } : undefined);
         ws.close();
       }
@@ -823,7 +903,7 @@ async function handleOpenAIProxy(
               pendingTokenRefresh.set(session.name, refreshPromise);
             }
             const result = await refreshPromise;
-            updateSessionToken(session.name, result.access_token);
+            await updateSessionToken(session.name, result.access_token);
             updateCodexAuthFile(result);
             session.token = result.access_token;
             if (result.refresh_token) session.refresh_token = result.refresh_token;
@@ -1117,7 +1197,11 @@ async function handleAdmin(
         Object.entries(sessions).map(([name, session]) => [name, { ...getSessionAdminView(name, session), ...health[name] }]),
       );
     }
-    res.end(JSON.stringify({ sessions: annotatedSessions, active_session }));
+    res.end(JSON.stringify({
+      sessions: annotatedSessions,
+      active_session,
+      chat_session_bindings: { ...chatSessionMap },
+    }));
     return;
   }
 
@@ -1128,7 +1212,7 @@ async function handleAdmin(
       res.end(JSON.stringify({ error: { type: "invalid_request", message: "name, provider, and token are required" } }));
       return;
     }
-    addSession(body.name, body.provider, body.token, body.base_url, body.model_override, body.account_id, body.refresh_token);
+    await addSession(body.name, body.provider, body.token, body.base_url, body.model_override, body.account_id, body.refresh_token);
     res.writeHead(201, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     return;
@@ -1136,7 +1220,7 @@ async function handleAdmin(
 
   if (req.method === "DELETE" && path.startsWith("/admin/sessions/")) {
     const name = decodeURIComponent(path.slice("/admin/sessions/".length));
-    removeSession(name);
+    await removeSession(name);
     res.writeHead(204);
     res.end();
     return;
@@ -1145,7 +1229,7 @@ async function handleAdmin(
   if (req.method === "POST" && path.startsWith("/admin/switch/")) {
     const name = decodeURIComponent(path.slice("/admin/switch/".length));
     try {
-      setActive(name);
+      await setActive(name);
       res.end(JSON.stringify({ ok: true, active_session: name }));
     } catch (err) {
       res.writeHead(404, { "content-type": "application/json" });

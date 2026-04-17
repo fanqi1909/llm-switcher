@@ -5,7 +5,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
+import { translateRequest, translateResponse, createWsEventProcessor, TranslationError } from "./translate.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -587,22 +587,28 @@ describe("translateResponse", () => {
     assert.equal(result.usage.output_tokens, 0);
   });
 
-  it("handles malformed JSON arguments gracefully (returns empty object)", () => {
-    const { response: result } = translateResponse({
-      id: "r",
-      model: "m",
-      status: "completed",
-      output: [
-        {
-          type: "function_call",
-          call_id: "call_bad",
-          name: "fn",
-          arguments: "NOT JSON",
-        },
-      ],
-      usage: { input_tokens: 0, output_tokens: 0 },
-    });
-    assert.deepEqual(result.content[0].input, {});
+  it("throws TranslationError on malformed JSON tool call arguments", () => {
+    assert.throws(
+      () => translateResponse({
+        id: "r",
+        model: "m",
+        status: "completed",
+        output: [
+          {
+            type: "function_call",
+            call_id: "call_bad",
+            name: "fn",
+            arguments: "NOT JSON",
+          },
+        ],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof TranslationError, "should be a TranslationError");
+        assert.match((err as Error).message, /Invalid JSON in tool call arguments/);
+        return true;
+      },
+    );
   });
 });
 
