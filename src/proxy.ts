@@ -49,12 +49,15 @@ interface RequestContext {
   readonly resolvedSession: string | null;
   readonly inferredProvider: Session["provider"] | null;
   readonly startedAt: number;
+  /** Worktree path mapping detected at admission time; null when not a worktree request. */
+  readonly worktreeMapping: { readonly original: string; readonly worktree: string } | null;
 }
 
 function buildRequestContext(
   chatSessionId: string | null,
   session: { name: string },
   resolution: RoutingResolution,
+  worktreeMapping: { original: string; worktree: string } | null,
 ): RequestContext {
   return {
     requestId: randomUUID(),
@@ -65,6 +68,7 @@ function buildRequestContext(
     resolvedSession: resolution.resolvedSessionName,
     inferredProvider: resolution.inferredProvider,
     startedAt: Date.now(),
+    worktreeMapping,
   };
 }
 
@@ -607,7 +611,11 @@ async function handleProxy(
     return;
   }
 
-  const ctx = buildRequestContext(chatSessionId, session, resolution);
+  // Freeze the session snapshot at admission time so no downstream code can
+  // silently mutate it (e.g. token refresh must not alter the admitted state).
+  Object.freeze(session);
+  const worktreeMapping = getWorktreeMapping(chatSessionId, body.system);
+  const ctx = buildRequestContext(chatSessionId, session, resolution, worktreeMapping);
   const routingHeaders = buildResponseHeaders(ctx);
   const routingData = getRoutingReasonData(resolution);
 
@@ -671,8 +679,9 @@ async function handleProxy(
         const newToken = await refreshPromise;
         if (!newToken) throw new Error("sniffOAuthToken returned null — claude CLI unavailable or not logged in");
         await updateSessionToken(session.name, newToken);
-        session.token = newToken;
-        // Re-inject billing header with the new token before retrying
+        // Re-inject billing header with the new token before retrying.
+        // Do NOT mutate session (it is frozen at admission time); newToken is
+        // passed explicitly to doAnthropicFetch instead.
         body = injectBillingHeader({ ...body }, newToken);
         console.error(`[Anthropic] Token refreshed, retrying`);
         return doAnthropicFetch(newToken, false);
@@ -773,7 +782,8 @@ async function handleOpenAIProxy(
     return;
   }
 
-  const worktreeMapping = getWorktreeMapping(ctx.chatSessionId, requestBody.system);
+  // Worktree mapping was snapshotted at admission time and stored in ctx.
+  const worktreeMapping = ctx.worktreeMapping;
 
   const translatedBody = JSON.parse(translated.body);
   const isStream = requestBody.stream === true;
@@ -909,8 +919,8 @@ async function handleOpenAIProxy(
             const result = await refreshPromise;
             await updateSessionToken(session.name, result.access_token);
             updateCodexAuthFile(result);
-            session.token = result.access_token;
-            if (result.refresh_token) session.refresh_token = result.refresh_token;
+            // Do NOT mutate session (it is frozen at admission time); the new
+            // token is passed directly to connectWs instead.
             console.error(`[OpenAI] Token refreshed, retrying`);
             connectWs(result.access_token, false);
             return;
