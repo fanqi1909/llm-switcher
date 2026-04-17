@@ -610,7 +610,7 @@ async function handleProxy(
         }
         const newToken = await refreshPromise;
         if (!newToken) throw new Error("sniffOAuthToken returned null — claude CLI unavailable or not logged in");
-        updateSessionToken(session.name, newToken);
+        await updateSessionToken(session.name, newToken);
         session.token = newToken;
         // Re-inject billing header with the new token before retrying
         body = injectBillingHeader({ ...body }, newToken);
@@ -823,7 +823,7 @@ async function handleOpenAIProxy(
               pendingTokenRefresh.set(session.name, refreshPromise);
             }
             const result = await refreshPromise;
-            updateSessionToken(session.name, result.access_token);
+            await updateSessionToken(session.name, result.access_token);
             updateCodexAuthFile(result);
             session.token = result.access_token;
             if (result.refresh_token) session.refresh_token = result.refresh_token;
@@ -1128,7 +1128,7 @@ async function handleAdmin(
       res.end(JSON.stringify({ error: { type: "invalid_request", message: "name, provider, and token are required" } }));
       return;
     }
-    addSession(body.name, body.provider, body.token, body.base_url, body.model_override, body.account_id, body.refresh_token);
+    await addSession(body.name, body.provider, body.token, body.base_url, body.model_override, body.account_id, body.refresh_token);
     res.writeHead(201, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     return;
@@ -1136,7 +1136,7 @@ async function handleAdmin(
 
   if (req.method === "DELETE" && path.startsWith("/admin/sessions/")) {
     const name = decodeURIComponent(path.slice("/admin/sessions/".length));
-    removeSession(name);
+    await removeSession(name);
     res.writeHead(204);
     res.end();
     return;
@@ -1145,7 +1145,7 @@ async function handleAdmin(
   if (req.method === "POST" && path.startsWith("/admin/switch/")) {
     const name = decodeURIComponent(path.slice("/admin/switch/".length));
     try {
-      setActive(name);
+      await setActive(name);
       res.end(JSON.stringify({ ok: true, active_session: name }));
     } catch (err) {
       res.writeHead(404, { "content-type": "application/json" });
