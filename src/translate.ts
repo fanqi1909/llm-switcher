@@ -539,8 +539,7 @@ function processEvent(
           try {
             parsed = JSON.parse(rawArgs);
           } catch {
-            console.error(`[translate] Tool call arguments are not valid JSON (outputIndex=${outputIndex}): ${rawArgs.slice(0, 120)}`);
-            parsed = {};
+            throw new TranslationError(`Tool call arguments are not valid JSON (outputIndex=${outputIndex}): ${rawArgs.slice(0, 120)}`);
           }
           const { result: rewritten } = rewriteInputPaths(parsed, mapping);
           const rewrittenJson = JSON.stringify(rewritten);

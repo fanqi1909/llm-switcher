@@ -977,6 +977,81 @@ describe("failure semantics — translation_error", () => {
       await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
     }
   });
+
+  it("emits SSE error event on streaming TranslationError and closes stream", async () => {
+    const { once: onceEv } = await import("node:events");
+
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await onceEv(upstreamServer.listen(0, "127.0.0.1"), "listening");
+    const addr = upstreamServer.address();
+    assert.ok(addr && typeof addr === "object");
+    const upstreamUrl = `ws://127.0.0.1:${addr.port}`;
+
+    // Simulate upstream sending function_call_arguments.done with bad JSON.
+    // The worktree mapping triggers path-rewriting which parses the args and
+    // will throw TranslationError on invalid JSON.
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({ type: "response.created", response: { id: "resp_1", model: "gpt-5.4" } }));
+        ws.send(JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { type: "function_call", call_id: "call_abc", name: "Edit", id: "item_1" },
+        }));
+        ws.send(JSON.stringify({
+          type: "response.function_call_arguments.done",
+          output_index: 0,
+          arguments: "NOT VALID JSON {{{{",
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    const WORKTREE_SYSTEM = "Working directory: /repo/.claude/worktrees/feat\n\nAssistant instructions here.";
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "gpt-stream", provider: "openai", token: "sk-test", model_override: "gpt-5.4" }),
+        });
+
+        const res = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            stream: true,
+            model: "gpt-5.4",
+            system: WORKTREE_SYSTEM,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        });
+
+        // Status 200 because headers were already sent before the error was detected
+        assert.equal(res.status, 200);
+        const body = await res.text();
+
+        // The SSE body must contain an error event
+        assert.ok(body.includes("event: error"), `expected SSE error event in body:\n${body}`);
+        const dataLines = body.split("\n").filter((l) => l.startsWith("data: "));
+        const errorData = dataLines.map((l) => {
+          try { return JSON.parse(l.slice(6)); } catch { return null; }
+        }).find((d) => d?.type === "error");
+        assert.ok(errorData, "expected a parseable error data line");
+        assert.equal(errorData.error.type, "translation_error");
+        assert.match(errorData.error.message, /not valid JSON/i);
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
 });
 
 describe("Anthropic OAuth token auto-refresh on 401", () => {

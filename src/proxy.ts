@@ -851,7 +851,27 @@ async function handleOpenAIProxy(
       }
 
       if (isStream) {
-        processWsEvent(event, writeSSE);
+        try {
+          processWsEvent(event, writeSSE);
+        } catch (translateErr) {
+          const msg = translateErr instanceof TranslationError
+            ? translateErr.message
+            : `Unexpected translation error: ${(translateErr as Error).message}`;
+          console.error(`[OpenAI] Streaming translation error: ${msg}`);
+          recordSessionError(session, {
+            requestedModel,
+            effectiveModel,
+            ...routingData,
+            type: "translation_error",
+            message: msg,
+            ctx,
+          });
+          writeSSE("error", { type: "error", error: { type: "translation_error", message: msg } });
+          responseDone = true;
+          res.end();
+          ws.close();
+          return;
+        }
         if (event.type === "response.completed") {
           recordSessionSuccess(session, {
             requestedModel,
