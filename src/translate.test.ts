@@ -1045,6 +1045,57 @@ describe("translateResponse with worktree mapping", () => {
     const toolBlock = result.content.find((b: any) => b.type === "tool_use");
     assert.equal(toolBlock.input.file_path, "/Users/x/project/src/foo.ts");
   });
+
+  it("rewrites command field path tokens in Bash tool calls", () => {
+    const openaiRes = {
+      id: "r_bash",
+      model: "gpt-5.4",
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call_bash",
+          name: "Bash",
+          arguments: JSON.stringify({
+            command: "grep -r foo /Users/x/project/src && ls /Users/x/project",
+          }),
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+
+    const { response: result, pathRewritten } = translateResponse(openaiRes, MAPPING);
+    const toolBlock = result.content.find((b: any) => b.type === "tool_use");
+    assert.ok(toolBlock);
+    assert.equal(
+      toolBlock.input.command,
+      "grep -r foo /Users/x/project/.claude/worktrees/agent-abc/src && ls /Users/x/project/.claude/worktrees/agent-abc",
+    );
+    assert.ok(pathRewritten);
+  });
+
+  it("does not rewrite command paths already in the worktree", () => {
+    const alreadyWorktree = "cat /Users/x/project/.claude/worktrees/agent-abc/src/foo.ts";
+    const openaiRes = {
+      id: "r_bash2",
+      model: "gpt-5.4",
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call_bash2",
+          name: "Bash",
+          arguments: JSON.stringify({ command: alreadyWorktree }),
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+
+    const { response: result, pathRewritten } = translateResponse(openaiRes, MAPPING);
+    const toolBlock = result.content.find((b: any) => b.type === "tool_use");
+    assert.equal(toolBlock.input.command, alreadyWorktree);
+    assert.ok(!pathRewritten);
+  });
 });
 
 describe("createWsEventProcessor with worktree mapping", () => {
@@ -1091,5 +1142,54 @@ describe("createWsEventProcessor with worktree mapping", () => {
     assert.equal(argDeltas.length, 2);
     assert.equal(argDeltas[0].data.delta.partial_json, '{"file_path"');
     assert.equal(argDeltas[1].data.delta.partial_json, ':"x"}');
+  });
+
+  it("rewrites command field path tokens in Bash tool calls", () => {
+    const processor = createWsEventProcessor(MAPPING);
+    const events = collectEvents(processor, [
+      { type: "response.created", response: { id: "r6", model: "gpt-5.4" } },
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", call_id: "call_6", name: "Bash" },
+      },
+      {
+        type: "response.function_call_arguments.done",
+        output_index: 0,
+        arguments: JSON.stringify({ command: "cat /Users/x/project/src/foo.ts && echo done" }),
+      },
+    ]);
+
+    const argDeltas = events.filter(
+      (e) => e.event === "content_block_delta" && e.data.delta.type === "input_json_delta",
+    );
+    assert.equal(argDeltas.length, 1);
+    const emitted = JSON.parse(argDeltas[0].data.delta.partial_json);
+    assert.equal(emitted.command, "cat /Users/x/project/.claude/worktrees/agent-abc/src/foo.ts && echo done");
+  });
+
+  it("does not double-rewrite already-worktree command paths", () => {
+    const processor = createWsEventProcessor(MAPPING);
+    const alreadyWorktree = "cat /Users/x/project/.claude/worktrees/agent-abc/src/foo.ts";
+    const events = collectEvents(processor, [
+      { type: "response.created", response: { id: "r7", model: "gpt-5.4" } },
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", call_id: "call_7", name: "Bash" },
+      },
+      {
+        type: "response.function_call_arguments.done",
+        output_index: 0,
+        arguments: JSON.stringify({ command: alreadyWorktree }),
+      },
+    ]);
+
+    const argDeltas = events.filter(
+      (e) => e.event === "content_block_delta" && e.data.delta.type === "input_json_delta",
+    );
+    assert.equal(argDeltas.length, 1);
+    const emitted = JSON.parse(argDeltas[0].data.delta.partial_json);
+    assert.equal(emitted.command, alreadyWorktree, "already-worktree path must not be double-rewritten");
   });
 });
