@@ -6,7 +6,7 @@ import type { Session } from "./config.js";
 import { buildCodexHeaders, refreshCodexToken, updateCodexAuthFile, loadCodexAuth } from "./codex.js";
 import { sniffOAuthToken } from "./login.js";
 import { inferProviderFromModel, pickDeterministicSessionName } from "./models.js";
-import { translateRequest, translateResponse, createWsEventProcessor } from "./translate.js";
+import { translateRequest, translateResponse, createWsEventProcessor, TranslationError } from "./translate.js";
 
 type FetchImpl = typeof fetch;
 type WsFactory = (url: string, options?: { headers?: Record<string, string> }) => WsWebSocket;
@@ -161,6 +161,8 @@ interface SessionObservability {
   last_used_at: string | null;
   last_error: { type: string; message: string; status?: number } | null;
   last_usage: SessionUsageSnapshot | null;
+  last_request_id: string | null;
+  last_chat_session_id: string | null;
   totals: {
     input_tokens: number;
     output_tokens: number;
@@ -264,6 +266,8 @@ function getSessionObservability(session: { name: string; model_override?: strin
       last_used_at: null,
       last_error: null,
       last_usage: null,
+      last_request_id: null,
+      last_chat_session_id: null,
       totals: {
         input_tokens: 0,
         output_tokens: 0,
@@ -299,6 +303,7 @@ function recordSessionSuccess(
     inferredProvider?: Session["provider"] | null;
     resolutionReason?: RoutingReason | null;
     usage?: { input_tokens?: number; output_tokens?: number } | null;
+    ctx?: RequestContext;
   },
 ): void {
   const snapshot = getSessionObservability(session);
@@ -309,6 +314,10 @@ function recordSessionSuccess(
   snapshot.last_resolution_reason = data.resolutionReason ?? snapshot.last_resolution_reason;
   snapshot.last_used_at = new Date().toISOString();
   snapshot.last_error = null;
+  if (data.ctx) {
+    snapshot.last_request_id = data.ctx.requestId;
+    snapshot.last_chat_session_id = data.ctx.chatSessionId;
+  }
   snapshot.totals.requests += 1;
 
   if (data.usage) {
@@ -331,6 +340,7 @@ function recordSessionError(
     type: string;
     message: string;
     status?: number;
+    ctx?: RequestContext;
   },
 ): void {
   const snapshot = getSessionObservability(session);
@@ -340,6 +350,10 @@ function recordSessionError(
   snapshot.last_inferred_provider = data.inferredProvider ?? snapshot.last_inferred_provider;
   snapshot.last_resolution_reason = data.resolutionReason ?? snapshot.last_resolution_reason;
   snapshot.last_used_at = new Date().toISOString();
+  if (data.ctx) {
+    snapshot.last_request_id = data.ctx.requestId;
+    snapshot.last_chat_session_id = data.ctx.chatSessionId;
+  }
   snapshot.last_error = {
     type: data.type,
     message: data.message,
@@ -676,6 +690,7 @@ async function handleProxy(
         requestedModel,
         effectiveModel,
         ...routingData,
+        ctx,
       });
       res.writeHead(upstreamRes.status, {
         "content-type": "text/event-stream",
@@ -711,6 +726,7 @@ async function handleProxy(
           effectiveModel,
           ...routingData,
           usage: parsed?.usage || null,
+          ctx,
         });
       } else {
         let parsed: any = null;
@@ -726,6 +742,7 @@ async function handleProxy(
           type: parsed?.error?.type || "upstream_error",
           message: parsed?.error?.message || `Upstream error ${upstreamRes.status}`,
           status: upstreamRes.status,
+          ctx,
         });
       }
     }
@@ -834,13 +851,34 @@ async function handleOpenAIProxy(
           ws.close();
         }
       } else if (event.type === "response.completed") {
+        let anthropicRes: any;
+        let pathRewritten = false;
+        try {
+          ({ response: anthropicRes, pathRewritten } = translateResponse(event.response, worktreeMapping));
+        } catch (translateErr) {
+          const msg = translateErr instanceof TranslationError
+            ? translateErr.message
+            : `Unexpected translation error: ${(translateErr as Error).message}`;
+          console.error(`[OpenAI] ${msg}`);
+          recordSessionError(session, {
+            requestedModel,
+            effectiveModel,
+            ...routingData,
+            type: "translation_error",
+            message: msg,
+            ctx,
+          });
+          endResponse(502, { error: { type: "translation_error", message: msg } });
+          ws.close();
+          return;
+        }
         recordSessionSuccess(session, {
           requestedModel,
           effectiveModel,
           ...routingData,
           usage: event.response?.usage || null,
+          ctx,
         });
-        const { response: anthropicRes, pathRewritten } = translateResponse(event.response, worktreeMapping);
         endResponse(200, anthropicRes, pathRewritten ? { "x-llm-path-rewritten": "true" } : undefined);
         ws.close();
       }
@@ -1159,7 +1197,11 @@ async function handleAdmin(
         Object.entries(sessions).map(([name, session]) => [name, { ...getSessionAdminView(name, session), ...health[name] }]),
       );
     }
-    res.end(JSON.stringify({ sessions: annotatedSessions, active_session }));
+    res.end(JSON.stringify({
+      sessions: annotatedSessions,
+      active_session,
+      chat_session_bindings: { ...chatSessionMap },
+    }));
     return;
   }
 

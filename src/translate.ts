@@ -278,7 +278,7 @@ export function translateResponse(openaiRes: any, mapping?: WorktreeMapping | nu
           }
         }
       } else if (item.type === "function_call") {
-        const input = safeJsonParse(item.arguments);
+        const input = safeJsonParse(item.arguments, true);
         let finalInput = input;
         if (mapping) {
           const { result, rewritten } = rewriteInputPaths(input, mapping);
@@ -329,10 +329,23 @@ function toToolUseId(id: string): string {
   return `toolu_${id.replace(/^call_/, "")}`;
 }
 
-function safeJsonParse(str: string): any {
+/** Thrown when a tool-call argument string is not valid JSON.
+ *  Callers that can still fail the request should catch this and return a
+ *  translation_error response rather than silently producing {} inputs. */
+export class TranslationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TranslationError";
+  }
+}
+
+function safeJsonParse(str: string, strict?: false): any;
+function safeJsonParse(str: string, strict: true): any;
+function safeJsonParse(str: string, strict = false): any {
   try {
     return JSON.parse(str);
   } catch {
+    if (strict) throw new TranslationError(`Invalid JSON in tool call arguments: ${str.slice(0, 120)}`);
     return {};
   }
 }
@@ -522,7 +535,13 @@ function processEvent(
         if (mapping) {
           // Rewrite paths in the complete arguments, then emit as a single delta
           const rawArgs = state.toolArgBuffer.get(outputIndex) ?? data.arguments ?? "";
-          const parsed = safeJsonParse(rawArgs);
+          let parsed: any;
+          try {
+            parsed = JSON.parse(rawArgs);
+          } catch {
+            console.error(`[translate] Tool call arguments are not valid JSON (outputIndex=${outputIndex}): ${rawArgs.slice(0, 120)}`);
+            parsed = {};
+          }
           const { result: rewritten } = rewriteInputPaths(parsed, mapping);
           const rewrittenJson = JSON.stringify(rewritten);
           writeEvent("content_block_delta", {

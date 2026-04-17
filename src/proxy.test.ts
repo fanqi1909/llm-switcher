@@ -893,6 +893,92 @@ describe("worktree path rewriting", () => {
   });
 });
 
+describe("admin session bindings", () => {
+  it("GET /admin/sessions includes chat_session_bindings", async () => {
+    await withServer(async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "s", provider: "anthropic", token: "sk-ant-test" }),
+      });
+
+      // Bind a chat session
+      await request(baseUrl, "/admin/chat-bind/chat-abc/s", { method: "POST" });
+
+      const res = await request(baseUrl, "/admin/sessions");
+      const body = JSON.parse(res.text);
+      assert.ok(body.chat_session_bindings, "should include chat_session_bindings");
+      assert.equal(body.chat_session_bindings["chat-abc"], "s");
+    });
+  });
+});
+
+describe("failure semantics — translation_error", () => {
+  it("returns 502 translation_error when OpenAI response has malformed tool call JSON", async () => {
+    const { once: onceEv, EventEmitter } = await import("node:events");
+
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await onceEv(upstreamServer.listen(0, "127.0.0.1"), "listening");
+    const addr = upstreamServer.address();
+    assert.ok(addr && typeof addr === "object");
+    const upstreamUrl = `ws://127.0.0.1:${addr.port}`;
+
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_bad",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [{
+              type: "function_call",
+              call_id: "call_x",
+              name: "Edit",
+              arguments: "NOT VALID JSON {{{{",
+            }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "gpt-bad", provider: "openai", token: "sk-test", model_override: "gpt-5.4" }),
+        });
+
+        const res = await request(baseUrl, "/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            stream: false,
+            model: "gpt-5.4",
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        });
+
+        assert.equal(res.status, 502);
+        const body = JSON.parse(res.text);
+        assert.equal(body.error.type, "translation_error");
+        assert.match(body.error.message, /Invalid JSON in tool call arguments/);
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+});
+
 describe("Anthropic OAuth token auto-refresh on 401", () => {
   it("re-sniffs token and retries when upstream returns 401", async () => {
     const expiredToken = "sk-ant-oat01-expired";
