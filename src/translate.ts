@@ -246,6 +246,27 @@ function translateToolChoice(choice: any): any {
 
 const PATH_FIELDS = ["file_path", "path"];
 
+/**
+ * Rewrite absolute path tokens in a Bash `command` string.
+ *
+ * Uses a negative-lookahead regex so that paths already inside the worktree
+ * (`mapping.original + mapping.worktree_suffix + /`) are left untouched while
+ * bare `mapping.original/...` occurrences are promoted to the worktree path.
+ *
+ * Conservative by design: only rewrites tokens that are immediately followed
+ * by `/`, so partial prefix matches (e.g. `/repo2/`) are never affected.
+ */
+function rewriteCommandTokens(command: string, mapping: WorktreeMapping): string {
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // worktree = original + suffix, e.g. "/repo" + "/.claude/worktrees/feat"
+  const suffix = mapping.worktree.slice(mapping.original.length); // "/.claude/worktrees/feat"
+  // Match mapping.original NOT already followed by the worktree suffix.
+  // The trailing lookahead accepts / (sub-path), whitespace, common shell delimiters,
+  // or end-of-string so that partial-prefix matches (/repo2/) are never rewritten.
+  const re = new RegExp(`${esc(mapping.original)}(?!${esc(suffix)})(?=[/\\s'";&|]|$)`, "g");
+  return command.replace(re, mapping.worktree);
+}
+
 function rewriteInputPaths(input: any, mapping: WorktreeMapping): { result: any; rewritten: boolean } {
   if (!input || typeof input !== "object") return { result: input, rewritten: false };
   const result = { ...input };
@@ -257,6 +278,13 @@ function rewriteInputPaths(input: any, mapping: WorktreeMapping): { result: any;
       !result[field].startsWith(mapping.worktree + "/")
     ) {
       result[field] = mapping.worktree + result[field].slice(mapping.original.length);
+      rewritten = true;
+    }
+  }
+  if (typeof result.command === "string" && result.command.includes(mapping.original + "/")) {
+    const rewrittenCmd = rewriteCommandTokens(result.command, mapping);
+    if (rewrittenCmd !== result.command) {
+      result.command = rewrittenCmd;
       rewritten = true;
     }
   }
@@ -539,8 +567,7 @@ function processEvent(
           try {
             parsed = JSON.parse(rawArgs);
           } catch {
-            console.error(`[translate] Tool call arguments are not valid JSON (outputIndex=${outputIndex}): ${rawArgs.slice(0, 120)}`);
-            parsed = {};
+            throw new TranslationError(`Tool call arguments are not valid JSON (outputIndex=${outputIndex}): ${rawArgs.slice(0, 120)}`);
           }
           const { result: rewritten } = rewriteInputPaths(parsed, mapping);
           const rewrittenJson = JSON.stringify(rewritten);

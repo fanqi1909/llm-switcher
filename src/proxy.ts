@@ -49,12 +49,15 @@ interface RequestContext {
   readonly resolvedSession: string | null;
   readonly inferredProvider: Session["provider"] | null;
   readonly startedAt: number;
+  /** Worktree path mapping detected at admission time; null when not a worktree request. */
+  readonly worktreeMapping: { readonly original: string; readonly worktree: string } | null;
 }
 
 function buildRequestContext(
   chatSessionId: string | null,
   session: { name: string },
   resolution: RoutingResolution,
+  worktreeMapping: { original: string; worktree: string } | null,
 ): RequestContext {
   return {
     requestId: randomUUID(),
@@ -65,6 +68,7 @@ function buildRequestContext(
     resolvedSession: resolution.resolvedSessionName,
     inferredProvider: resolution.inferredProvider,
     startedAt: Date.now(),
+    worktreeMapping,
   };
 }
 
@@ -243,6 +247,7 @@ export function resetRuntimeObservability(): void {
   for (const key of Object.keys(rateLimits)) delete rateLimits[key];
   for (const key of Object.keys(sessionObservability)) delete sessionObservability[key];
   for (const key of Object.keys(sessionProbeStatus)) delete sessionProbeStatus[key];
+  for (const key of Object.keys(chatSessionMap)) delete chatSessionMap[key];
   pendingTokenRefresh.clear();
   pendingAnthropicRefresh.clear();
   worktreeMappings.clear();
@@ -490,6 +495,20 @@ function resolveHttpRouting(req: IncomingMessage, body: any, chatSessionId: stri
     };
   }
 
+  // chat_binding_fallback takes priority over model-based routing so that
+  // switching sessions mid-chat (via /admin/chat-bind) is respected even when
+  // the request body carries a model that would otherwise match a different session.
+  const chatBoundSession = chatSessionId ? chatSessionMap[chatSessionId] : undefined;
+  if (chatBoundSession) {
+    return {
+      requestedSession: chatBoundSession,
+      requestedModel: typeof body.model === "string" && body.model.trim() ? body.model.trim() : null,
+      resolvedSessionName: chatBoundSession,
+      inferredProvider: null,
+      reason: "chat_binding_fallback",
+    };
+  }
+
   const modelResolution = resolveModelRoutedSession(body.model);
   if (modelResolution.reason === "model_override_exact" || modelResolution.reason === "session_name_alias") {
     return {
@@ -498,17 +517,6 @@ function resolveHttpRouting(req: IncomingMessage, body: any, chatSessionId: stri
       resolvedSessionName: modelResolution.resolvedSessionName,
       inferredProvider: modelResolution.inferredProvider,
       reason: modelResolution.reason,
-    };
-  }
-
-  const chatBoundSession = chatSessionId ? chatSessionMap[chatSessionId] : undefined;
-  if (chatBoundSession) {
-    return {
-      requestedSession: chatBoundSession,
-      requestedModel: modelResolution.requestedModel,
-      resolvedSessionName: chatBoundSession,
-      inferredProvider: modelResolution.inferredProvider,
-      reason: "chat_binding_fallback",
     };
   }
 
@@ -603,7 +611,11 @@ async function handleProxy(
     return;
   }
 
-  const ctx = buildRequestContext(chatSessionId, session, resolution);
+  // Freeze the session snapshot at admission time so no downstream code can
+  // silently mutate it (e.g. token refresh must not alter the admitted state).
+  Object.freeze(session);
+  const worktreeMapping = getWorktreeMapping(chatSessionId, body.system);
+  const ctx = buildRequestContext(chatSessionId, session, resolution, worktreeMapping);
   const routingHeaders = buildResponseHeaders(ctx);
   const routingData = getRoutingReasonData(resolution);
 
@@ -667,8 +679,9 @@ async function handleProxy(
         const newToken = await refreshPromise;
         if (!newToken) throw new Error("sniffOAuthToken returned null — claude CLI unavailable or not logged in");
         await updateSessionToken(session.name, newToken);
-        session.token = newToken;
-        // Re-inject billing header with the new token before retrying
+        // Re-inject billing header with the new token before retrying.
+        // Do NOT mutate session (it is frozen at admission time); newToken is
+        // passed explicitly to doAnthropicFetch instead.
         body = injectBillingHeader({ ...body }, newToken);
         console.error(`[Anthropic] Token refreshed, retrying`);
         return doAnthropicFetch(newToken, false);
@@ -769,7 +782,8 @@ async function handleOpenAIProxy(
     return;
   }
 
-  const worktreeMapping = getWorktreeMapping(ctx.chatSessionId, requestBody.system);
+  // Worktree mapping was snapshotted at admission time and stored in ctx.
+  const worktreeMapping = ctx.worktreeMapping;
 
   const translatedBody = JSON.parse(translated.body);
   const isStream = requestBody.stream === true;
@@ -837,7 +851,27 @@ async function handleOpenAIProxy(
       }
 
       if (isStream) {
-        processWsEvent(event, writeSSE);
+        try {
+          processWsEvent(event, writeSSE);
+        } catch (translateErr) {
+          const msg = translateErr instanceof TranslationError
+            ? translateErr.message
+            : `Unexpected translation error: ${(translateErr as Error).message}`;
+          console.error(`[OpenAI] Streaming translation error: ${msg}`);
+          recordSessionError(session, {
+            requestedModel,
+            effectiveModel,
+            ...routingData,
+            type: "translation_error",
+            message: msg,
+            ctx,
+          });
+          writeSSE("error", { type: "error", error: { type: "translation_error", message: msg } });
+          responseDone = true;
+          res.end();
+          ws.close();
+          return;
+        }
         if (event.type === "response.completed") {
           recordSessionSuccess(session, {
             requestedModel,
@@ -905,8 +939,8 @@ async function handleOpenAIProxy(
             const result = await refreshPromise;
             await updateSessionToken(session.name, result.access_token);
             updateCodexAuthFile(result);
-            session.token = result.access_token;
-            if (result.refresh_token) session.refresh_token = result.refresh_token;
+            // Do NOT mutate session (it is frozen at admission time); the new
+            // token is passed directly to connectWs instead.
             console.error(`[OpenAI] Token refreshed, retrying`);
             connectWs(result.access_token, false);
             return;

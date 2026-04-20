@@ -977,6 +977,81 @@ describe("failure semantics — translation_error", () => {
       await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
     }
   });
+
+  it("emits SSE error event on streaming TranslationError and closes stream", async () => {
+    const { once: onceEv } = await import("node:events");
+
+    const upstreamServer = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamServer });
+
+    await onceEv(upstreamServer.listen(0, "127.0.0.1"), "listening");
+    const addr = upstreamServer.address();
+    assert.ok(addr && typeof addr === "object");
+    const upstreamUrl = `ws://127.0.0.1:${addr.port}`;
+
+    // Simulate upstream sending function_call_arguments.done with bad JSON.
+    // The worktree mapping triggers path-rewriting which parses the args and
+    // will throw TranslationError on invalid JSON.
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", () => {
+        ws.send(JSON.stringify({ type: "response.created", response: { id: "resp_1", model: "gpt-5.4" } }));
+        ws.send(JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { type: "function_call", call_id: "call_abc", name: "Edit", id: "item_1" },
+        }));
+        ws.send(JSON.stringify({
+          type: "response.function_call_arguments.done",
+          output_index: 0,
+          arguments: "NOT VALID JSON {{{{",
+        }));
+      });
+    });
+
+    const proxy = createProxyServer({
+      openAIWsFactory: (_url, options) => new WebSocket(upstreamUrl, options),
+    });
+
+    const WORKTREE_SYSTEM = "Working directory: /repo/.claude/worktrees/feat\n\nAssistant instructions here.";
+
+    try {
+      await withCustomServer(proxy, async (baseUrl) => {
+        await request(baseUrl, "/admin/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "gpt-stream", provider: "openai", token: "sk-test", model_override: "gpt-5.4" }),
+        });
+
+        const res = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            stream: true,
+            model: "gpt-5.4",
+            system: WORKTREE_SYSTEM,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        });
+
+        // Status 200 because headers were already sent before the error was detected
+        assert.equal(res.status, 200);
+        const body = await res.text();
+
+        // The SSE body must contain an error event
+        assert.ok(body.includes("event: error"), `expected SSE error event in body:\n${body}`);
+        const dataLines = body.split("\n").filter((l) => l.startsWith("data: "));
+        const errorData = dataLines.map((l) => {
+          try { return JSON.parse(l.slice(6)); } catch { return null; }
+        }).find((d) => d?.type === "error");
+        assert.ok(errorData, "expected a parseable error data line");
+        assert.equal(errorData.error.type, "translation_error");
+        assert.match(errorData.error.message, /not valid JSON/i);
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => upstreamWss.close((err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => upstreamServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
 });
 
 describe("Anthropic OAuth token auto-refresh on 401", () => {
@@ -1140,6 +1215,174 @@ describe("Anthropic OAuth token auto-refresh on 401", () => {
       assert.equal(r2.status, 200);
       assert.equal(r3.status, 200);
       assert.equal(sniffCallCount, 1, "sniffOAuthToken should only be called once despite concurrent 401s");
+    });
+  });
+});
+
+describe("Phase A — admission snapshot isolation", () => {
+  const MOCK_RESPONSE = JSON.stringify({
+    id: "msg_snapshot",
+    type: "message",
+    role: "assistant",
+    content: [],
+    model: "claude-opus-4-5",
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+
+  it("in-flight request uses originally routed session after admin active session changes", async () => {
+    // fetchResolvers[i] is called to unblock upstream fetch i
+    const fetchResolvers: Array<(r: Response) => void> = [];
+
+    const proxy = createProxyServer({
+      fetchImpl: async () =>
+        new Promise<Response>((resolve) => {
+          fetchResolvers.push(resolve);
+        }),
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      // Add two sessions; session-a is added first → becomes active
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "session-a", provider: "anthropic", token: "sk-ant-token-a" }),
+      });
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "session-b", provider: "anthropic", token: "sk-ant-token-b" }),
+      });
+
+      // Start request 1 — it will block waiting for the upstream fetch
+      const pendingRequest = fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+      // Wait until the proxy has started the upstream fetch (resolver pushed)
+      await new Promise<void>((resolve) => {
+        const poll = setInterval(() => {
+          if (fetchResolvers.length >= 1) { clearInterval(poll); resolve(); }
+        }, 5);
+      });
+
+      // Switch active session while request 1 is in-flight
+      await request(baseUrl, "/admin/switch/session-b", { method: "POST" });
+
+      // Unblock request 1's upstream fetch
+      fetchResolvers[0](new Response(MOCK_RESPONSE, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+
+      const r1 = await pendingRequest;
+      // Request 1 was admitted when session-a was active → must stay on session-a
+      assert.equal(r1.headers.get("x-llm-session-used"), "session-a");
+      assert.equal(r1.headers.get("x-llm-routing-reason"), "active_session_fallback");
+
+      // Request 2, started after the switch, must use session-b.
+      // Start it, wait for its upstream fetch to block, then unblock it.
+      const pendingRequest2 = fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+      await new Promise<void>((resolve) => {
+        const poll = setInterval(() => {
+          if (fetchResolvers.length >= 2) { clearInterval(poll); resolve(); }
+        }, 5);
+      });
+      fetchResolvers[1](new Response(MOCK_RESPONSE, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+      const r2 = await pendingRequest2;
+      assert.equal(r2.headers.get("x-llm-session-used"), "session-b");
+    });
+  });
+
+  it("token refresh on one session does not alter the token used by a concurrent request to a different session", async () => {
+    const expiredToken = "sk-ant-oat01-expired-session-a";
+    const freshToken = "sk-ant-oat01-fresh-session-a";
+    const validToken = "sk-ant-api03-session-b-valid";
+
+    const usedTokens: string[] = [];
+
+    // Hold session-a's retry until we've confirmed session-b has completed
+    let resolveSniff!: () => void;
+    const sniffGate = new Promise<void>((r) => { resolveSniff = r; });
+
+    const proxy = createProxyServer({
+      fetchImpl: async (_url, init) => {
+        const headers = (init?.headers as Record<string, string>) ?? {};
+        // OAuth tokens → Authorization: Bearer <token>; API keys → x-api-key: <token>
+        const auth = headers.authorization ?? "";
+        const apiKey = headers["x-api-key"] ?? "";
+        const token = auth.startsWith("Bearer ") ? auth.slice(7) : apiKey;
+        if (token === expiredToken) {
+          return new Response(JSON.stringify({ error: { type: "auth_error" } }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        usedTokens.push(token);
+        return new Response(MOCK_RESPONSE, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      sniffOAuthTokenImpl: async () => {
+        // Gate: wait until the test signals session-b has completed
+        await sniffGate;
+        return freshToken;
+      },
+    });
+
+    await withCustomServer(proxy, async (baseUrl) => {
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "session-a", provider: "anthropic", token: expiredToken }),
+      });
+      await request(baseUrl, "/admin/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "session-b", provider: "anthropic", token: validToken }),
+      });
+
+      // Fire session-a request (will hit 401 and block on sniff)
+      const reqA = request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-llm-session": "session-a" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "A" }] }),
+      });
+
+      // Session-b request runs concurrently and should complete independently
+      const rB = await request(baseUrl, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-llm-session": "session-b" },
+        body: JSON.stringify({ model: "claude-opus-4-5", max_tokens: 10, messages: [{ role: "user", content: "B" }] }),
+      });
+      assert.equal(rB.status, 200);
+      assert.equal(rB.headers.get("x-llm-session-used"), "session-b");
+
+      // Unblock session-a's sniff now that session-b has finished
+      resolveSniff();
+      const rA = await reqA;
+      assert.equal(rA.status, 200);
+      assert.equal(rA.headers.get("x-llm-session-used"), "session-a");
+
+      // session-b must have used its own validToken, not session-a's freshToken
+      const bToken = usedTokens.find((t) => t === validToken);
+      const aToken = usedTokens.find((t) => t === freshToken);
+      assert.ok(bToken, "session-b should have used its own valid token");
+      assert.ok(aToken, "session-a should have retried with the fresh token");
+      assert.ok(
+        !usedTokens.some((t) => t === freshToken && usedTokens.indexOf(t) < usedTokens.indexOf(validToken)),
+        "session-a fresh token must not have been used before session-b completed",
+      );
     });
   });
 });
