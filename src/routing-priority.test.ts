@@ -229,7 +229,7 @@ describe("routing priority matrix", () => {
       await addSession(baseUrl, "session-active");
       await addSession(baseUrl, "session-bound");
       // make session-active the active session
-      await fetch(`${baseUrl}/admin/sessions/session-active/activate`, {
+      await fetch(`${baseUrl}/admin/switch/session-active`, {
         method: "POST",
       });
       await bindChat(baseUrl, "chat-1", "session-bound");
@@ -258,7 +258,7 @@ describe("routing priority matrix", () => {
   it("model_override_exact beats active_session_fallback", async () => {
     await withServer(async (baseUrl) => {
       await addSession(baseUrl, "session-active");
-      await fetch(`${baseUrl}/admin/sessions/session-active/activate`, {
+      await fetch(`${baseUrl}/admin/switch/session-active`, {
         method: "POST",
       });
       await addSession(baseUrl, "session-override", {
@@ -275,7 +275,7 @@ describe("routing priority matrix", () => {
   it("session_name_alias beats active_session_fallback", async () => {
     await withServer(async (baseUrl) => {
       await addSession(baseUrl, "session-active");
-      await fetch(`${baseUrl}/admin/sessions/session-active/activate`, {
+      await fetch(`${baseUrl}/admin/switch/session-active`, {
         method: "POST",
       });
       await addSession(baseUrl, "session-named");
@@ -290,7 +290,7 @@ describe("routing priority matrix", () => {
   it("active_session_fallback beats provider_inference_match", async () => {
     await withServer(async (baseUrl) => {
       await addSession(baseUrl, "session-active", { provider: "anthropic" });
-      await fetch(`${baseUrl}/admin/sessions/session-active/activate`, {
+      await fetch(`${baseUrl}/admin/switch/session-active`, {
         method: "POST",
       });
 
